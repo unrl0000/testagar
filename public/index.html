@@ -2,30 +2,68 @@
 <html lang="en">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <!-- Важно для мобильных: отключить масштабирование и задать ширину -->
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Simple Agar Clone (Node.js)</title>
-    <link rel="stylesheet" href="style.css"> <!-- Путь теперь относительный -->
-    <!-- Подключаем клиентскую библиотеку Socket.IO -->
-    <!-- Можно оставить CDN или скачать и положить в public -->
+    <link rel="stylesheet" href="style.css">
     <script src="https://cdn.socket.io/4.7.2/socket.io.min.js"></script>
+    <style>
+        /* Добавим стили для джойстика прямо сюда для простоты,
+           но лучше вынести их в style.css */
+        .joystick {
+            position: absolute;
+            bottom: 50px; /* Отступ снизу */
+            left: 50px;  /* Отступ слева */
+            width: 120px; /* Размер базы */
+            height: 120px;
+            background-color: rgba(128, 128, 128, 0.4); /* Полупрозрачный серый */
+            border-radius: 50%; /* Круглая форма */
+            display: none; /* Скрыт по умолчанию */
+            pointer-events: auto; /* Разрешить взаимодействие */
+            touch-action: none; /* Предотвратить скролл/зум при касании джойстика */
+        }
+
+        .joystick-handle {
+            position: absolute;
+            width: 60px;  /* Размер ручки */
+            height: 60px;
+            background-color: rgba(200, 200, 200, 0.6);
+            border-radius: 50%;
+            /* Центрируем ручку внутри базы */
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%); /* Точное центрирование */
+            pointer-events: none; /* Ручка сама не ловит события */
+        }
+
+        /* Стиль для скрытия элементов */
+        .hidden {
+            display: none !important;
+        }
+    </style>
 </head>
 <body>
     <div id="game-area">
         <canvas id="game-canvas"></canvas>
         <div id="ui-overlay">
-             <div id="name-prompt" style="display: block; text-align: center; margin-top: 20%; color: white; background: rgba(0,0,0,0.7); padding: 20px; max-width: 300px; margin-left: auto; margin-right: auto; border-radius: 10px;">
+             <!-- Форма входа -->
+             <div id="name-prompt">
                  <h2>Enter your nickname:</h2>
                  <input type="text" id="nickname-input" maxlength="15" placeholder="Blob">
                  <button id="play-button">Play</button>
              </div>
-             <div id="game-over-message" style="display: none; text-align: center; margin-top: 20%; color: red; background: rgba(0,0,0,0.8); padding: 30px; max-width: 400px; margin-left: auto; margin-right: auto; border-radius: 10px; font-size: 2em;">
+             <!-- Сообщение Game Over -->
+             <div id="game-over-message" class="hidden">
                  Game Over!
-                 <button id="respawn-button" style="display: block; margin: 15px auto;">Play Again</button>
+                 <button id="respawn-button">Play Again</button>
+             </div>
+
+             <!-- Элементы джойстика -->
+             <div id="joystick-base" class="joystick">
+                 <div id="joystick-handle" class="joystick-handle"></div>
              </div>
         </div>
     </div>
-
-    <!-- Подключаем наш игровой скрипт -->
-    <script src="game.js"></script> <!-- Путь теперь относительный -->
+    <script src="game.js"></script>
 </body>
 </html>
