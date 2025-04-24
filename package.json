@@ -1,0 +1,22 @@
+{
+  "name": "agar-node",
+  "version": "1.0.0",
+  "description": "Simple Agar.io clone with Node.js",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [
+    "agar",
+    "game",
+    "socket.io",
+    "node"
+  ],
+  "author": "",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^4.18.2",
+    "socket.io": "^4.7.2"
+  }
+}
