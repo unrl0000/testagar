@@ -1,18 +1,15 @@
 {
-  "name": "dipper-io",
+  "name": "dipper.io",
   "version": "1.0.0",
-  "description": "A simple browser multiplayer game like diep.io",
+  "description": "A simple multiplayer browser game like diep.io",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "engines": {
-    "node": ">=14.0.0" 
-  },
   "author": "Your Name",
   "license": "ISC",
   "dependencies": {
-    "ws": "^8.8.0"
+    "ws": "^8.13.0"
   }
 }
