@@ -1,660 +1,683 @@
-// client.js
-const canvas = document.getElementById('game-canvas');
-const ctx = canvas.getContext('2d');
+// server.js
+const express = require('express');
+const http = require('http');
+const WebSocket = require('ws');
+const path = require('path');
+const { v4: uuidv4 } = require('uuid');
 
-const startScreen = document.getElementById('start-screen');
-const nameInput = document.getElementById('name-input');
-const raceSelection = document.getElementById('race-selection');
-const raceButtons = raceSelection.querySelectorAll('button');
-const startButton = document.getElementById('start-button');
-const errorMessage = document.getElementById('error-message');
-const level2SelectionScreen = document.getElementById('level2-selection');
-const level2OptionsDiv = document.getElementById('level2-options');
+const app = express();
+const server = http.createServer(app);
+const wss = new WebSocket.Server({ server });
 
-const touchControls = document.getElementById('touch-controls');
-const joystickArea = document.getElementById('joystick-area');
-const joystickThumb = document.getElementById('joystick-thumb');
-const attackButton = document.getElementById('attack-button');
+// --- Game Constants ---
+const MAP_WIDTH = 2000;
+const MAP_HEIGHT = 2000;
+const PLAYER_RADIUS = 15;
+const PLAYER_SPEED = 2.5;
+const ORB_RADIUS = 5;
+const ORB_COUNT = 150;
+const XP_PER_ORB = 10;
+const XP_TO_LEVEL_2 = 100; // Experience needed for level 2
+const PLAYER_MAX_HP = 100;
+const PROJECTILE_RADIUS = 5;
+const PROJECTILE_SPEED = 7;
+const PROJECTILE_DAMAGE = 10;
+const ATTACK_COOLDOWN = 500; // milliseconds
+const MELEE_RANGE = PLAYER_RADIUS * 2.5;
+const LIFESTEAL_PERCENT = 0.1; // 10% for Lord Vampires
 
-let ws; // WebSocket connection
-let selfId = null; // This client's player ID
-let gameState = { players: [], orbs: [], projectiles: [] };
-let mapWidth = 2000; // Default, will be updated by server
-let mapHeight = 2000;
-let selectedRace = null;
-let serverTimeOffset = 0; // For potential future interpolation/prediction
+// --- Game State ---
+let players = new Map(); // Map<playerId, playerData>
+let orbs = new Map(); // Map<orbId, orbData>
+let projectiles = new Map(); // Map<projectileId, projectileData>
 
-// --- Input State ---
-let inputState = {
-    up: false,
-    down: false,
-    left: false,
-    right: false,
-    attack: false,
-    mouseX: 0,
-    mouseY: 0
-};
-let mouseScreenX = window.innerWidth / 2;
-let mouseScreenY = window.innerHeight / 2;
-
-// --- Camera State ---
-let camera = {
-    x: 0,
-    y: 0,
-    zoom: 1.0 // Future feature?
-};
-
-// --- Touch Control State ---
-let touchIdentifier = null;
-let joystickActive = false;
-let joystickStartX = 0;
-let joystickStartY = 0;
-let joystickCurrentX = 0;
-let joystickCurrentY = 0;
-const JOYSTICK_RADIUS = joystickArea.offsetWidth / 2;
-const THUMB_RADIUS = joystickThumb.offsetWidth / 2;
-const MAX_JOYSTICK_DIST = JOYSTICK_RADIUS - THUMB_RADIUS;
-
-// --- Game Setup ---
-function init() {
-    setupStartScreen();
-    setupInputListeners();
-    resizeCanvas();
-    window.addEventListener('resize', resizeCanvas);
-    detectTouchDevice();
+// --- Player Data Structure ---
+function createPlayer(id, ws, name, race) {
+    const raceData = getRaceBaseStats(race);
+    return {
+        id: id,
+        ws: ws, // Keep a reference to the WebSocket connection
+        name: name,
+        x: Math.random() * (MAP_WIDTH - 100) + 50,
+        y: Math.random() * (MAP_HEIGHT - 100) + 50,
+        vx: 0, // Velocity x
+        vy: 0, // Velocity y
+        hp: raceData.hp,
+        maxHp: raceData.hp,
+        level: 1,
+        xp: 0,
+        race: race,
+        classOrMutation: null, // 'warrior', 'mage', 'lord', 'higher', 'king', 'hobgoblin'
+        color: raceData.color,
+        radius: PLAYER_RADIUS,
+        speed: raceData.speed,
+        attackCooldown: 0, // Time until next attack is allowed
+        lastInput: null, // { up, down, left, right, attack, mouseX, mouseY }
+        isDead: false,
+        killCount: 0,
+        canChooseLevel2: false, // Flag to show selection screen
+        stats: { ...raceData.stats } // Specific stats like damage, range, lifesteal etc.
+    };
 }
 
-function resizeCanvas() {
-    canvas.width = window.innerWidth;
-    canvas.height = window.innerHeight;
-}
-
-function detectTouchDevice() {
-    const isTouch = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-    if (isTouch) {
-        touchControls.style.display = 'block'; // Show touch controls
-        setupTouchControls();
+function getRaceBaseStats(race) {
+    const base = { hp: PLAYER_MAX_HP, speed: PLAYER_SPEED, color: '#ffffff', stats: { damage: 10, range: 0, lifesteal: 0, projectileSpeed: PROJECTILE_SPEED, attackSpeedModifier: 1 } };
+    switch (race) {
+        case 'human': base.color = '#4287f5'; break; // Blue
+        case 'elf': base.color = '#34eb4f'; base.speed *= 1.1; break; // Green, faster
+        case 'gnome': base.color = '#a67b5b'; base.hp *= 1.1; break; // Brown, tankier
+        case 'vampire': base.color = '#d92525'; base.stats.lifesteal = 0.02; break; // Dark Red, slight lifesteal
+        case 'goblin': base.color = '#6a706b'; base.speed *= 1.05; base.hp *= 0.9; break; // Gray, slightly faster, less hp
     }
+    base.maxHp = base.hp; // Ensure maxHp is set correctly
+    // Default range for level 1 or melee types
+     base.stats.range = MELEE_RANGE; // Ensure a default range is set
+     base.stats.damage = 10; // Ensure a default damage is set
+    return base;
 }
 
-function setupStartScreen() {
-    raceButtons.forEach(button => {
-        button.addEventListener('click', () => {
-            raceButtons.forEach(btn => btn.classList.remove('selected'));
-            button.classList.add('selected');
-            selectedRace = button.getAttribute('data-race');
+function applyLevel2Specialization(player, choice) {
+    player.classOrMutation = choice;
+    player.canChooseLevel2 = false; // Choice made
+
+    // Reset/Apply specific stats based on choice
+    const baseRaceStats = getRaceBaseStats(player.race);
+    player.stats = { ...baseRaceStats.stats }; // Reset to base race stats first
+    player.speed = baseRaceStats.speed;
+    player.maxHp = baseRaceStats.hp;
+    // Keep current HP percentage
+    const hpPercent = player.hp / player.maxHp;
+
+
+    switch (choice) {
+        // --- Human/Elf/Gnome Classes ---
+        case 'warrior':
+            player.maxHp *= 1.3;
+            player.stats.damage *= 1.5; // Higher melee damage
+            player.stats.range = MELEE_RANGE * 1.2; // Melee attack type, slight reach
+            player.color = lightenDarkenColor(player.color, -20); // Darker shade
+            break;
+        case 'mage':
+            player.maxHp *= 0.9;
+            player.stats.damage *= 12; // Standard projectile damage (increased slightly)
+            player.stats.range = 400; // Ranged attack type
+            player.stats.attackSpeedModifier = 0.8; // Slightly faster attacks
+            player.color = lightenDarkenColor(player.color, 20); // Lighter shade
+            break;
+
+        // --- Vampire Mutations ---
+        case 'lord': // Lifesteal focus
+            player.stats.lifesteal = LIFESTEAL_PERCENT;
+            player.maxHp *= 1.1;
+            player.stats.damage *= 1.1;
+            player.stats.range = MELEE_RANGE * 1.1; // Melee
+            player.color = '#a11b1b'; // Deeper red
+            break;
+        case 'higher': // Speed/Attack speed focus
+            player.speed *= 1.2;
+            player.stats.attackSpeedModifier = 0.6; // Faster attacks
+            player.stats.lifesteal = 0.05; // Keep some lifesteal
+            player.stats.range = MELEE_RANGE * 1.05; // Keep melee or slight reach
+            player.color = '#f75454'; // Brighter red
+            break;
+
+        // --- Goblin Mutations ---
+        case 'king': // Tankier / Minor support (conceptual)
+            player.maxHp *= 1.4;
+            player.stats.damage *= 1.1;
+            player.stats.range = MELEE_RANGE * 0.9; // Slightly shorter melee
+            player.color = '#494d4a'; // Darker gray/green
+            // Could add logic for minions here later
+            break;
+        case 'hobgoblin': // Brute force
+            player.maxHp *= 1.2;
+            player.speed *= 0.85; // Slower
+            player.stats.damage *= 1.8; // High melee damage
+            player.stats.range = MELEE_RANGE * 1.1; // Slightly longer melee reach
+            player.color = '#819185'; // More greenish/brownish gray
+            break;
+    }
+     // Re-apply HP percentage to new maxHp
+     player.hp = player.maxHp * hpPercent;
+     if (player.hp > player.maxHp) player.hp = player.maxHp; // Cap HP
+
+     // Notify client about the update
+     safeSend(player.ws, JSON.stringify({ type: 'classSelected', player: getPlayerDataForClient(player) }));
+}
+
+// --- Orb Logic ---
+function spawnOrb() {
+    if (orbs.size < ORB_COUNT) {
+        const orbId = uuidv4();
+        orbs.set(orbId, {
+            id: orbId,
+            x: Math.random() * MAP_WIDTH,
+            y: Math.random() * MAP_HEIGHT,
+            radius: ORB_RADIUS,
+            value: XP_PER_ORB,
+            color: '#f0e370' // Yellowish
         });
-    });
-
-    startButton.addEventListener('click', joinGame);
-    nameInput.addEventListener('keypress', (e) => {
-        if (e.key === 'Enter') {
-            joinGame();
-        }
-    });
+    }
 }
 
-function joinGame() {
-    const name = nameInput.value.trim();
-    if (!name) {
-        showError("Please enter a name.");
-        return;
-    }
-    if (!selectedRace) {
-        showError("Please select a race.");
-        return;
+// --- Projectile Logic ---
+function createProjectile(owner) {
+    // Check range indicates a ranged attack type (e.g., Mage)
+    if (!owner.lastInput || owner.attackCooldown > 0 || !owner.stats.range || owner.stats.range <= MELEE_RANGE * 1.5) {
+        return; // Only ranged classes shoot projectiles (use a slightly larger threshold than MELEE_RANGE)
     }
 
-    startScreen.style.display = 'none';
-    canvas.style.display = 'block';
-    errorMessage.textContent = '';
+    const projId = uuidv4();
+    const angle = Math.atan2(owner.lastInput.mouseY - owner.y, owner.lastInput.mouseX - owner.x);
+    const speed = owner.stats.projectileSpeed || PROJECTILE_SPEED;
+    const range = owner.stats.range; // Use player's stats for range
 
-    connectWebSocket(name, selectedRace);
-}
-
-function showError(message) {
-    errorMessage.textContent = message;
-}
-
-// --- WebSocket Connection ---
-function connectWebSocket(name, race) {
-    // Use wss:// if the site is served over https, ws:// otherwise
-    const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
-    const wsUrl = `${protocol}://${window.location.host}`; // Connect to the same host serving the page
-
-    console.log(`Connecting to ${wsUrl}`);
-    ws = new WebSocket(wsUrl);
-
-    ws.onopen = () => {
-        console.log('Connected to WebSocket server.');
-        // Send join message
-        ws.send(JSON.stringify({ type: 'join', name: name, race: race }));
-        // Start sending input updates
-        setInterval(sendInput, 1000 / 30); // Send input ~30 times/sec
-    };
-
-    ws.onmessage = (event) => {
-        try {
-            const message = JSON.parse(event.data);
-            switch (message.type) {
-                case 'welcome':
-                    selfId = message.playerId;
-                    mapWidth = message.mapWidth;
-                    mapHeight = message.mapHeight;
-                    console.log(`Joined game with ID: ${selfId}`);
-                    requestAnimationFrame(gameLoop); // Start rendering loop
-                    break;
-                case 'gameState':
-                    // Directly update game state. Could add interpolation later.
-                    gameState = message;
-                    break;
-                 case 'levelUpReady':
-                     console.log("Level up ready! Showing selection.");
-                     showLevel2Selection();
-                     break;
-                 case 'classSelected':
-                     console.log("Class/Mutation confirmed by server.");
-                      // Update self player data if necessary (already done via gameState generally)
-                     level2SelectionScreen.style.display = 'none'; // Hide selection
-                     break;
-                // Handle other message types (player death, chat, etc.)
-            }
-        } catch (error) {
-            console.error('Error processing message:', event.data, error);
-        }
-    };
-
-    ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
-        showError('Connection error. Please refresh.');
-        // Maybe try to reconnect?
-    };
-
-    ws.onclose = () => {
-        console.log('WebSocket connection closed.');
-        showError('Disconnected from server. Please refresh.');
-        // Stop game loop? Show start screen?
-        cancelAnimationFrame(gameLoop); // Stop rendering
-        startScreen.style.display = 'block';
-        canvas.style.display = 'none';
-         touchControls.style.display = 'none';
-         level2SelectionScreen.style.display = 'none';
-    };
-}
-
-// --- Input Handling ---
-function setupInputListeners() {
-    // Keyboard
-    window.addEventListener('keydown', (e) => {
-        if (level2SelectionScreen.style.display !== 'none') return; // Ignore input if choosing class
-        switch (e.key.toLowerCase()) {
-            case 'w': case 'arrowup': inputState.up = true; break;
-            case 's': case 'arrowdown': inputState.down = true; break;
-            case 'a': case 'arrowleft': inputState.left = true; break;
-            case 'd': case 'arrowright': inputState.right = true; break;
-        }
+    projectiles.set(projId, {
+        id: projId,
+        ownerId: owner.id,
+        x: owner.x + Math.cos(angle) * (owner.radius + PROJECTILE_RADIUS + 1),
+        y: owner.y + Math.sin(angle) * (owner.radius + PROJECTILE_RADIUS + 1),
+        dx: Math.cos(angle) * speed,
+        dy: Math.sin(angle) * speed,
+        radius: PROJECTILE_RADIUS,
+        damage: owner.stats.damage || PROJECTILE_DAMAGE,
+        color: lightenDarkenColor(owner.color, 30), // Slightly lighter than owner
+        rangeLeft: range // Use player's range stat
     });
 
-    window.addEventListener('keyup', (e) => {
-        switch (e.key.toLowerCase()) {
-            case 'w': case 'arrowup': inputState.up = false; break;
-            case 's': case 'arrowdown': inputState.down = false; break;
-            case 'a': case 'arrowleft': inputState.left = false; break;
-            case 'd': case 'arrowright': inputState.right = false; break;
-        }
-    });
-
-    // Mouse
-    canvas.addEventListener('mousemove', (e) => {
-        mouseScreenX = e.clientX;
-        mouseScreenY = e.clientY;
-    });
-
-    canvas.addEventListener('mousedown', (e) => {
-         if (level2SelectionScreen.style.display !== 'none') return;
-        if (e.button === 0) { // Left mouse button
-            inputState.attack = true;
-        }
-    });
-
-     // Prevent continuous attack on mouse down for now, trigger per click
-    canvas.addEventListener('mouseup', (e) => {
-        if (e.button === 0) {
-            // inputState.attack = false; // If you want attack on hold, remove this line
-        }
-    });
-
-     // Prevent context menu on right click
-     canvas.addEventListener('contextmenu', (e) => e.preventDefault());
+    owner.attackCooldown = ATTACK_COOLDOWN / (owner.stats.attackSpeedModifier || 1);
 }
 
-function setupTouchControls() {
-    joystickArea.addEventListener('touchstart', handleJoystickStart, { passive: false });
-    joystickArea.addEventListener('touchmove', handleJoystickMove, { passive: false });
-    joystickArea.addEventListener('touchend', handleJoystickEnd, { passive: false });
-    joystickArea.addEventListener('touchcancel', handleJoystickEnd, { passive: false });
-
-    attackButton.addEventListener('touchstart', (e) => {
-         e.preventDefault();
-         if (level2SelectionScreen.style.display !== 'none') return;
-         inputState.attack = true;
-     }, { passive: false });
-
-     attackButton.addEventListener('touchend', (e) => {
-          e.preventDefault();
-         // inputState.attack = false; // If attack on hold is desired
-     }, { passive: false });
-
-     // Aiming with touch - use center of screen or last known "tap" location?
-     // For simplicity, let's make touch aim towards center initially, or handle tap-to-aim later
-     // We will use mouseX/mouseY derived from joystick for aiming if active, otherwise center?
-}
-
-function handleJoystickStart(e) {
-    e.preventDefault();
-    if (level2SelectionScreen.style.display !== 'none') return;
-    joystickActive = true;
-    const touch = e.changedTouches[0];
-    touchIdentifier = touch.identifier;
-    const rect = joystickArea.getBoundingClientRect();
-    joystickStartX = rect.left + JOYSTICK_RADIUS;
-    joystickStartY = rect.top + JOYSTICK_RADIUS;
-    joystickCurrentX = touch.clientX;
-    joystickCurrentY = touch.clientY;
-    updateJoystickThumb();
-}
-
-function handleJoystickMove(e) {
-    e.preventDefault();
-    if (!joystickActive || level2SelectionScreen.style.display !== 'none') return;
-    const touch = Array.from(e.changedTouches).find(t => t.identifier === touchIdentifier);
-    if (!touch) return;
-
-    joystickCurrentX = touch.clientX;
-    joystickCurrentY = touch.clientY;
-    updateJoystickThumb();
-    updateInputFromJoystick();
-}
-
-function handleJoystickEnd(e) {
-    e.preventDefault();
-    const touch = Array.from(e.changedTouches).find(t => t.identifier === touchIdentifier);
-     if (!touch) { // Might be a different touch ending
-         // Check if ALL touches ended on the joystick, if so reset
-         let stillTouchingJoystick = false;
-         for(let i=0; i<e.touches.length; i++){
-             const t = e.touches[i];
-             const rect = joystickArea.getBoundingClientRect();
-             if(t.clientX >= rect.left && t.clientX <= rect.right && t.clientY >= rect.top && t.clientY <= rect.bottom) {
-                 stillTouchingJoystick = true;
-                 break;
-             }
-         }
-         if (!stillTouchingJoystick) {
-             resetJoystick();
-         }
+// --- Melee Attack Logic ---
+function performMeleeAttack(attacker) {
+    // Check range indicates a melee attack type (e.g., Warrior, Vampire, Goblin)
+     if (!attacker.lastInput || attacker.attackCooldown > 0 || !attacker.stats.range || attacker.stats.range > MELEE_RANGE * 1.5) {
          return;
      }
 
-    resetJoystick();
-}
-function resetJoystick(){
-     joystickActive = false;
-     touchIdentifier = null;
-     joystickThumb.style.transform = `translate(0px, 0px)`;
-     inputState.up = false;
-     inputState.down = false;
-     inputState.left = false;
-     inputState.right = false;
-     // Reset aiming direction? Or keep last known?
-     // inputState.mouseX = canvas.width / 2 + camera.x; // Aim center world
-     // inputState.mouseY = canvas.height / 2 + camera.y;
-}
+    attacker.attackCooldown = ATTACK_COOLDOWN / (attacker.stats.attackSpeedModifier || 1);
+    const attackAngle = Math.atan2(attacker.lastInput.mouseY - attacker.y, attacker.lastInput.mouseX - attacker.x);
+    const reach = attacker.stats.range;
 
-// Модифицируем функцию updateJoystickThumb и updateInputFromJoystick
-function updateJoystickThumb() {
-    let dx = joystickCurrentX - joystickStartX;
-    let dy = joystickCurrentY - joystickStartY;
-    const distance = Math.sqrt(dx * dx + dy * dy);
+    // Увеличиваем конус атаки для более надежного попадания
+    const attackCone = Math.PI / 3; // 60 градусов
 
-    // Добавляем мертвую зону
-    const deadZone = JOYSTICK_RADIUS * 0.15;
-    if (distance < deadZone) {
-        joystickThumb.style.transform = `translate(0px, 0px)`;
-        return;
-    }
-
-    let clampedX = dx;
-    let clampedY = dy;
-
-    if (distance > MAX_JOYSTICK_DIST) {
-        const scale = MAX_JOYSTICK_DIST / distance;
-        clampedX = dx * scale;
-        clampedY = dy * scale;
-    }
-
-    joystickThumb.style.transform = `translate(${clampedX}px, ${clampedY}px)`;
-}
-
-function updateInputFromJoystick() {
-    let dx = joystickCurrentX - joystickStartX;
-    let dy = joystickCurrentY - joystickStartY;
-    const distance = Math.sqrt(dx * dx + dy * dy);
-    const threshold = JOYSTICK_RADIUS * 0.15; // Увеличиваем мертвую зону
-
-    if (distance < threshold) {
-        inputState.up = false;
-        inputState.down = false;
-        inputState.left = false;
-        inputState.right = false;
-        return;
-    }
-
-    // Используем более плавную реакцию, основанную на величине отклонения
-    const angle = Math.atan2(dy, dx);
-    const normalizedDistance = Math.min(distance / MAX_JOYSTICK_DIST, 1);
-    
-    // Смягчаем управление - использование векторов вместо булевых флагов
-    inputState.up = Math.cos(angle - Math.PI/2) * normalizedDistance > 0.3;
-    inputState.down = Math.cos(angle - Math.PI/2) * normalizedDistance < -0.3;
-    inputState.left = Math.cos(angle) * normalizedDistance < -0.3;
-    inputState.right = Math.cos(angle) * normalizedDistance > 0.3;
-    
-    // Обновляем прицеливание
-    const worldAimX = camera.x + dx * 5; 
-    const worldAimY = camera.y + dy * 5;
-    inputState.mouseX = worldAimX;
-    inputState.mouseY = worldAimY;
-}
+    // Send visual confirmation of attack to the attacker's client
+    safeSend(attacker.ws, JSON.stringify({
+        type: 'meleeVisual',
+        angle: attackAngle,
+        reach: reach,
+        playerId: attacker.id // Send attacker's ID
+    }));
 
 
-function sendInput() {
-    if (!ws || ws.readyState !== WebSocket.OPEN || !selfId) return;
+    for (const [targetId, target] of players) {
+        if (targetId === attacker.id || target.isDead || target.canChooseLevel2) continue; // Don't hit self, dead, or choosing players
 
-    // If not using touch joystick, calculate mouse world coordinates
-    if (!joystickActive) {
-        const selfPlayer = gameState.players.find(p => p.id === selfId);
-        if (selfPlayer) {
-            const canvasCenterX = canvas.width / 2;
-            const canvasCenterY = canvas.height / 2;
-            inputState.mouseX = selfPlayer.x + (mouseScreenX - canvasCenterX); // Convert screen mouse to world coords
-            inputState.mouseY = selfPlayer.y + (mouseScreenY - canvasCenterY);
+        const dist = distance(attacker.x, attacker.y, target.x, target.y);
+        // Check if target is within range AND the cone
+        if (dist < reach + target.radius) {
+            const targetAngle = Math.atan2(target.y - attacker.y, target.x - attacker.x);
+            const angleDiff = Math.abs(normalizeAngle(attackAngle - targetAngle));
+
+             // Check if target is within the attack cone
+             if (angleDiff < attackCone / 2) { // Divide cone by 2 for angle difference check
+                 dealDamage(target, attacker.stats.damage, attacker);
+                 // Send hit confirmation to the attacker's client
+                 safeSend(attacker.ws, JSON.stringify({
+                     type: 'hitConfirm',
+                     damage: attacker.stats.damage,
+                     targetId: targetId
+                 }));
+                 break; // Hit one target per swing
+             }
         }
     }
-     // else: mouseX/mouseY are updated by joystick handler
-
-    ws.send(JSON.stringify({ type: 'input', input: inputState }));
-
-    // Reset attack state after sending if it's a per-click trigger
-    inputState.attack = false;
 }
 
-// --- Level 2 Specialization Screen ---
-function showLevel2Selection() {
-    const player = gameState.players.find(p => p.id === selfId);
-    if (!player) return;
 
-    level2OptionsDiv.innerHTML = ''; // Clear previous options
+// --- Damage & Death ---
+function dealDamage(target, damage, dealer) {
+    if (target.isDead || target.canChooseLevel2) return;
 
-    let choices = [];
-    switch (player.race) {
-        case 'human':
-        case 'elf':
-        case 'gnome':
-            choices = [
-                { id: 'warrior', name: 'Warrior', desc: '+HP, Melee Dmg' },
-                { id: 'mage', name: 'Mage', desc: 'Ranged Attack' }
-            ];
-            break;
-        case 'vampire':
-            choices = [
-                { id: 'lord', name: 'Lord Vampire', desc: 'High Lifesteal, +HP' },
-                { id: 'higher', name: 'Higher Vampire', desc: '+Speed, +Atk Speed' }
-            ];
-            break;
-        case 'goblin':
-            choices = [
-                { id: 'king', name: 'Goblin King', desc: '++HP, Okay Dmg' }, // Desc simplified
-                { id: 'hobgoblin', name: 'Hobgoblin', desc: '+HP, High Melee Dmg, -Speed' }
-            ];
-            break;
+    const actualDamage = damage; // Could add defense/armor calculations here
+    target.hp -= actualDamage;
+
+    // Lifesteal
+    if (dealer && players.has(dealer.id) && dealer.stats && dealer.stats.lifesteal > 0) {
+        const healAmount = actualDamage * dealer.stats.lifesteal;
+        dealer.hp = Math.min(dealer.maxHp, dealer.hp + healAmount);
+         // Client will see HP change in the next state update
     }
 
-    choices.forEach(choice => {
-        const button = document.createElement('button');
-        button.textContent = `${choice.name} (${choice.desc})`;
-        button.onclick = () => {
-            if (ws && ws.readyState === WebSocket.OPEN) {
-                ws.send(JSON.stringify({ type: 'selectClass', choice: choice.id }));
-                 // Optimistically hide, server confirmation will finalize
-                 //level2SelectionScreen.style.display = 'none';
+    // Notify the target client they were hit (for visual effect)
+     safeSend(target.ws, JSON.stringify({
+         type: 'wasHit',
+         damageTaken: actualDamage
+     }));
+
+
+    if (target.hp <= 0) {
+        target.hp = 0;
+        target.isDead = true;
+        target.vx = 0;
+        target.vy = 0;
+        // Clear existing input to stop movement prediction on client
+        target.lastInput = { up: false, down: false, left: false, right: false, attack: false, mouseX: 0, mouseY: 0 };
+        console.log(`${target.name} killed by ${dealer ? dealer.name : 'Unknown'}`);
+
+        if (dealer && players.has(dealer.id)) { // Check if dealer still exists
+             dealer.killCount++;
+             const xpDrop = Math.min(target.xp / 2 + 50, 500); // Drop some XP on death
+             dealer.xp += xpDrop;
+             checkLevelUp(dealer);
+        }
+
+        // Respawn logic
+        setTimeout(() => {
+            if (players.has(target.id)) { // Check if player hasn't disconnected
+                 const raceData = getRaceBaseStats(target.race);
+                 target.x = Math.random() * (MAP_WIDTH - 100) + 50;
+                 target.y = Math.random() * (MAP_HEIGHT - 100) + 50;
+                 // Reset HP/MaxHP based on current class/race (or base race if level 1)
+                 const currentStats = target.classOrMutation ? getPlayerStatsAfterLevel2(target.race, target.classOrMutation) : getRaceBaseStats(target.race);
+                 target.maxHp = currentStats.hp; // Use correct max HP
+                 target.hp = target.maxHp; // Respawn with full HP
+                 target.xp = Math.floor(target.xp * 0.5); // Lose half XP on death
+                 // Re-check level up readiness if XP is still high enough
+                 if (target.level < 2 && target.xp >= XP_TO_LEVEL_2) {
+                      target.canChooseLevel2 = true;
+                       safeSend(target.ws, JSON.stringify({ type: 'levelUpReady' }));
+                 } else if (target.level === 2 && target.xp < XP_TO_LEVEL_2 / 2) {
+                      // Optional: Demote if XP drops too low after death? More complex. Let's keep Lvl 2 if they reached it.
+                      // If we did demote:
+                      // target.level = 1;
+                      // target.classOrMutation = null;
+                      // const base = getRaceBaseStats(target.race);
+                      // target.stats = {...base.stats};
+                      // target.speed = base.speed;
+                      // target.maxHp = base.hp;
+                      // target.hp = target.maxHp;
+                      // target.color = base.color;
+                 }
+
+
+                 target.isDead = false;
+                 // Reset kill count on death? Or keep it for leaderboard score? Let's keep for simplicity.
+                 // target.killCount = 0;
+                 console.log(`${target.name} respawned`);
             }
-        };
-        level2OptionsDiv.appendChild(button);
-    });
-
-    level2SelectionScreen.style.display = 'block';
-}
-
-
-// --- Rendering ---
-function gameLoop(timestamp) {
-    if (!selfId || !ws || ws.readyState !== WebSocket.OPEN) {
-        // Don't run loop if not connected or initialized
-        // console.log("Game loop halted - not connected or initialized.");
-        return;
-    }
-
-    const selfPlayer = gameState.players.find(p => p.id === selfId);
-
-    // Clear canvas
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-    // Обновите камеру с плавным переходом
-    if (selfPlayer) {
-        // Вместо прямого присваивания используем интерполяцию
-        const cameraLerpFactor = 0.08; // Чем меньше, тем плавнее
-        camera.x += (selfPlayer.x - camera.x) * cameraLerpFactor;
-        camera.y += (selfPlayer.y - camera.y) * cameraLerpFactor;
-    }
-
-    // Translate canvas to camera position
-    ctx.save();
-    ctx.translate(canvas.width / 2 - camera.x, canvas.height / 2 - camera.y);
-
-    // Draw game elements (world relative)
-    drawMapBackground(); // Draw simple grid or boundaries
-    drawOrbs(gameState.orbs);
-    drawProjectiles(gameState.projectiles);
-    drawPlayers(gameState.players);
-
-    // Restore context for UI elements
-    ctx.restore();
-
-    // Draw UI elements (screen relative)
-    if (selfPlayer) {
-        drawUI(selfPlayer);
-    }
-
-    // Request next frame
-    requestAnimationFrame(gameLoop);
-}
-
-function drawMapBackground() {
-    // Simple boundary box
-    ctx.strokeStyle = '#555';
-    ctx.lineWidth = 5;
-    ctx.strokeRect(0, 0, mapWidth, mapHeight);
-
-    // Optional: Simple grid
-    const gridSize = 100;
-    ctx.strokeStyle = '#444';
-    ctx.lineWidth = 1;
-    for (let x = 0; x <= mapWidth; x += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(x, 0);
-        ctx.lineTo(x, mapHeight);
-        ctx.stroke();
-    }
-    for (let y = 0; y <= mapHeight; y += gridSize) {
-        ctx.beginPath();
-        ctx.moveTo(0, y);
-        ctx.lineTo(mapWidth, y);
-        ctx.stroke();
+        }, 5000); // 5 second respawn timer
     }
 }
 
-function drawOrbs(orbs) {
-    ctx.fillStyle = '#f0e370'; // Orb color
-    orbs.forEach(orb => {
-         if(isElementVisible(orb, orb.radius * 2)) {
-              ctx.beginPath();
-              ctx.arc(orb.x, orb.y, orb.radius, 0, Math.PI * 2);
-              ctx.fill();
-         }
-    });
+// Helper to get stats AFTER level 2 selection (used for respawn HP)
+function getPlayerStatsAfterLevel2(race, choice) {
+     const base = getRaceBaseStats(race); // Start from base race stats
+     let stats = { ...base.stats }; // Copy stats object
+     let maxHp = base.hp;
+     let speed = base.speed;
+
+     switch (choice) {
+         case 'warrior': maxHp *= 1.3; stats.damage *= 1.5; stats.range = MELEE_RANGE * 1.2; break;
+         case 'mage': maxHp *= 0.9; stats.damage = 12; stats.range = 400; stats.attackSpeedModifier = 0.8; break;
+         case 'lord': stats.lifesteal = LIFESTEAL_PERCENT; maxHp *= 1.1; stats.damage *= 1.1; stats.range = MELEE_RANGE * 1.1; break;
+         case 'higher': speed *= 1.2; stats.attackSpeedModifier = 0.6; stats.lifesteal = 0.05; stats.range = MELEE_RANGE * 1.05; break;
+         case 'king': maxHp *= 1.4; stats.damage *= 1.1; stats.range = MELEE_RANGE * 0.9; break;
+         case 'hobgoblin': maxHp *= 1.2; speed *= 0.85; stats.damage *= 1.8; stats.range = MELEE_RANGE * 1.1; break;
+     }
+     return { hp: maxHp, speed: speed, stats: stats };
 }
 
-function drawProjectiles(projectiles) {
-    projectiles.forEach(proj => {
-        if(isElementVisible(proj, proj.radius * 2)) {
-            // Добавляем эффект "хвоста" для снарядов
-            ctx.fillStyle = proj.color || '#ffffff';
-            ctx.beginPath();
-            ctx.arc(proj.x, proj.y, proj.radius, 0, Math.PI * 2);
-            ctx.fill();
-            
-            // Добавляем след для наглядности
-            ctx.strokeStyle = proj.color || '#ffffff';
-            ctx.globalAlpha = 0.5;
-            ctx.beginPath();
-            ctx.moveTo(proj.x, proj.y);
-            ctx.lineTo(proj.x - proj.dx*3, proj.y - proj.dy*3);
-            ctx.stroke();
-            ctx.globalAlpha = 1.0;
+
+// --- Leveling ---
+function checkLevelUp(player) {
+    if (player.level === 1 && player.xp >= XP_TO_LEVEL_2) {
+        player.level = 2;
+        player.canChooseLevel2 = true; // Set flag
+        // Notify the client they can level up
+        safeSend(player.ws, JSON.stringify({ type: 'levelUpReady' }));
+        console.log(`${player.name} reached Level 2! Awaiting class selection.`);
+    }
+    // Add logic for higher levels later if needed
+}
+
+// --- Utility Functions ---
+function distance(x1, y1, x2, y2) {
+    return Math.sqrt(Math.pow(x1 - x2, 2) + Math.pow(y1 - y2, 2));
+}
+
+function normalizeAngle(angle) {
+     while (angle <= -Math.PI) angle += 2 * Math.PI;
+     while (angle > Math.PI) angle -= 2 * Math.PI;
+     return angle;
+ }
+
+function lightenDarkenColor(col, amt) {
+    let usePound = false;
+    if (col[0] == "#") {
+        col = col.slice(1);
+        usePound = true;
+    }
+    let num = parseInt(col, 16);
+    let r = (num >> 16) + amt;
+    if (r > 255) r = 255;
+    else if (r < 0) r = 0;
+    let b = ((num >> 8) & 0x00FF) + amt;
+    if (b > 255) b = 255;
+    else if (b < 0) b = 0;
+    let g = (num & 0x0000FF) + amt;
+    if (g > 255) g = 255;
+    else if (g < 0) g = 0;
+
+    // Pad the color string with leading zeros if needed
+    let color = (g | (b << 8) | (r << 16)).toString(16);
+    while(color.length < 6) {
+        color = "0" + color;
+    }
+    return (usePound ? "#" : "") + color;
+}
+
+
+// Safe send function to avoid errors if ws is closed
+function safeSend(ws, data) {
+    if (ws.readyState === WebSocket.OPEN) {
+        try {
+             ws.send(data);
+        } catch (e) {
+             console.error("Error sending message:", e);
         }
-    });
+    }
 }
 
-function drawPlayers(players) {
+// --- Game Loop ---
+function gameLoop() {
+    const now = Date.now();
+    const deltaTime = (now - (lastUpdateTime || now)) / 1000.0; // Time since last update in seconds
+    lastUpdateTime = now;
+
+    // 1. Process Inputs & Update Velocities
     players.forEach(player => {
-        if (player.isDead) return; // Don't draw dead players for now
+        if (player.isDead || player.canChooseLevel2 || !player.lastInput) {
+             player.vx = 0;
+             player.vy = 0;
+             return;
+        }
 
-        if(isElementVisible(player, player.radius * 4)) { // Wider check for name/hp bar
-            // Draw Player Circle
-            ctx.fillStyle = player.color || '#cccccc';
-            ctx.strokeStyle = '#000000'; // Black outline
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.stroke();
+        let moveX = 0;
+        let moveY = 0;
+        // Apply movement input directly
+        if (player.lastInput.up) moveY -= 1;
+        if (player.lastInput.down) moveY += 1;
+        if (player.lastInput.left) moveX -= 1;
+        if (player.lastInput.right) moveX += 1;
 
-            // Draw Name & Level
-            ctx.fillStyle = '#ffffff';
-            ctx.textAlign = 'center';
-            ctx.font = 'bold 12px sans-serif';
-            ctx.fillText(`${player.name} [${player.level}]`, player.x, player.y - player.radius - 15);
+        const magnitude = Math.sqrt(moveX * moveX + moveY * moveY);
+        if (magnitude > 0) {
+            player.vx = (moveX / magnitude) * player.speed;
+            player.vy = (moveY / magnitude) * player.speed;
+        } else {
+            player.vx = 0;
+            player.vy = 0;
+        }
 
-            // Draw HP Bar
-            const hpBarWidth = player.radius * 2;
-            const hpBarHeight = 5;
-            const hpBarX = player.x - hpBarWidth / 2;
-            const hpBarY = player.y - player.radius - 10;
-            const hpPercent = player.hp / player.maxHp;
+        // Attack Cooldown
+        if (player.attackCooldown > 0) {
+            player.attackCooldown -= deltaTime * 1000; // Decrement cooldown in ms
+        }
 
-            ctx.fillStyle = '#555'; // Background of HP bar
-            ctx.fillRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
-            ctx.fillStyle = hpPercent > 0.5 ? '#4CAF50' : (hpPercent > 0.2 ? '#ff9800' : '#f44336'); // Green/Yellow/Red
-            ctx.fillRect(hpBarX, hpBarY, hpBarWidth * hpPercent, hpBarHeight);
-            ctx.strokeStyle = '#333';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
+        // Handle Attack Input
+        if (player.lastInput.attack && player.attackCooldown <= 0) {
+             // Check if player has chosen a class yet. Level 1 attack or specific Lvl 2 attack.
+             if (player.classOrMutation === null) { // Level 1 attack
+                 // Give level 1 players a basic melee attack
+                 player.stats.range = MELEE_RANGE * 0.8; // Default short range
+                 player.stats.damage = 5; // Low damage
+                 player.stats.attackSpeedModifier = 1; // Default speed
+                 performMeleeAttack(player);
+             } else if (player.stats.range > MELEE_RANGE * 1.5) { // Ranged attack (Mage check, using a threshold)
+                 createProjectile(player);
+             } else { // Melee attack (Warrior, Vampire, Goblin mutations)
+                 performMeleeAttack(player);
+             }
+             // Note: inputState.attack is reset client-side per tick. Server just acts if it sees true.
         }
     });
-    // Добавьте визуальный индикатор получения урона
-    if (player.lastDamage && Date.now() - player.lastDamage < 300) {
-        ctx.strokeStyle = '#ff0000';
-        ctx.lineWidth = 4;
-        ctx.beginPath();
-        ctx.arc(player.x, player.y, player.radius * 1.2, 0, Math.PI * 2);
-        ctx.stroke();
+
+    // 2. Update Positions & Check Boundaries
+    players.forEach(player => {
+        if (player.isDead || player.canChooseLevel2) return;
+        player.x += player.vx; // Simple Euler integration
+        player.y += player.vy;
+
+        // Boundary checks
+        player.x = Math.max(player.radius, Math.min(MAP_WIDTH - player.radius, player.x));
+        player.y = Math.max(player.radius, Math.min(MAP_HEIGHT - player.radius, player.y));
+    });
+
+     // 3. Update Projectiles & Check Collisions
+    const projectilesToRemove = [];
+    projectiles.forEach(proj => {
+        proj.x += proj.dx;
+        proj.y += proj.dy;
+        const distanceTraveled = Math.sqrt(proj.dx*proj.dx + proj.dy*proj.dy);
+        proj.rangeLeft -= distanceTraveled;
+
+        // Check projectile out of range or bounds
+        if (proj.rangeLeft <= 0 || proj.x < -100 || proj.x > MAP_WIDTH + 100 || proj.y < -100 || proj.y > MAP_HEIGHT + 100) { // Add margin
+            projectilesToRemove.push(proj.id);
+            return; // Continue to next projectile
+        }
+
+        // Check projectile collision with players
+        for (const [targetId, target] of players) {
+            if (targetId === proj.ownerId || target.isDead || target.canChooseLevel2) continue; // Don't hit self, dead, or choosing players
+
+            const dist = distance(proj.x, proj.y, target.x, target.y);
+            if (dist < target.radius + proj.radius) {
+                const owner = players.get(proj.ownerId);
+                dealDamage(target, proj.damage, owner);
+                projectilesToRemove.push(proj.id); // Remove projectile on hit
+                 return; // Projectile hits one target, stop checking players for this projectile
+            }
+        }
+    });
+    projectilesToRemove.forEach(id => projectiles.delete(id));
+
+
+    // 4. Check Player-Orb Collisions
+    const orbsToRemove = [];
+    players.forEach(player => {
+        if (player.isDead || player.canChooseLevel2) return; // Don't collect orbs while choosing class or dead
+
+        orbs.forEach(orb => {
+            const dist = distance(player.x, player.y, orb.x, orb.y);
+            const attractRadius = player.radius + orb.radius + 50; // Orbs get attracted slightly
+            if (dist < attractRadius) {
+                 // Simple attraction logic
+                 const angle = Math.atan2(player.y - orb.y, player.x - orb.x);
+                 const attractSpeed = 1; // Pixels per tick
+                 orb.x += Math.cos(angle) * attractSpeed;
+                 orb.y += Math.sin(angle) * attractSpeed;
+            }
+
+
+            if (dist < player.radius + orb.radius) { // Actual collision
+                player.xp += orb.value;
+                orbsToRemove.push(orb.id);
+                checkLevelUp(player); // Check if player leveled up
+            }
+        });
+    });
+    orbsToRemove.forEach(id => orbs.delete(id));
+
+    // 5. Spawn new orbs
+    if (Math.random() < 0.2 && orbs.size < ORB_COUNT) { // Chance to spawn an orb each tick, up to max
+        spawnOrb();
     }
+
+    // 6. Prepare State Update for Clients
+    const playersData = [];
+    players.forEach(p => {
+        // Send player data including dead state and canChooseLevel2
+        playersData.push(getPlayerDataForClient(p));
+    });
+    const orbsData = Array.from(orbs.values());
+    const projectilesData = Array.from(projectiles.values());
+
+    const gameState = {
+        type: 'gameState',
+        players: playersData,
+        orbs: orbsData,
+        projectiles: projectilesData
+    };
+    const gameStateString = JSON.stringify(gameState);
+
+    // 7. Broadcast State to all connected clients
+    wss.clients.forEach(client => {
+        if (client.readyState === WebSocket.OPEN) {
+            // Optional: send only nearby players/orbs/projectiles
+            // For simplicity, broadcasting full state in this minimal example
+            safeSend(client, gameStateString);
+        }
+    });
 }
 
-function drawUI(selfPlayer) {
-    // Draw XP Bar (Bottom Center)
-    const xpBarWidth = canvas.width * 0.4;
-    const xpBarHeight = 15;
-    const xpBarX = (canvas.width - xpBarWidth) / 2;
-    const xpBarY = canvas.height - xpBarHeight - 15; // 15px from bottom
-
-    let xpForNextLevel = Infinity; // Default for max level
-    let xpCurrentLevelBase = 0;
-
-    if (selfPlayer.level === 1) {
-        xpForNextLevel = 100; // XP_TO_LEVEL_2 should match server
-        xpCurrentLevelBase = 0;
-    }
-     // Add logic here if higher levels are implemented
-
-    const xpProgress = selfPlayer.xp - xpCurrentLevelBase;
-    const xpNeeded = xpForNextLevel - xpCurrentLevelBase;
-    const xpPercent = Math.min(1, xpNeeded > 0 ? xpProgress / xpNeeded : 1);
-
-    ctx.fillStyle = '#555'; // Background
-    ctx.fillRect(xpBarX, xpBarY, xpBarWidth, xpBarHeight);
-    ctx.fillStyle = '#f0e370'; // XP Color (Yellow)
-    ctx.fillRect(xpBarX, xpBarY, xpBarWidth * xpPercent, xpBarHeight);
-
-    // XP Text
-    ctx.fillStyle = '#ffffff';
-    ctx.textAlign = 'center';
-    ctx.font = '12px sans-serif';
-    const xpText = xpNeeded > 0 ? `${xpProgress} / ${xpNeeded} XP` : `Level ${selfPlayer.level} (MAX)`;
-    ctx.fillText(xpText, canvas.width / 2, xpBarY + xpBarHeight / 1.5);
-    ctx.strokeStyle = '#000';
-    ctx.lineWidth = 0.5;
-    ctx.strokeText(xpText, canvas.width / 2, xpBarY + xpBarHeight / 1.5);
-
-
-     // Draw Level (above XP bar)
-     ctx.fillStyle = '#ffffff';
-     ctx.textAlign = 'center';
-     ctx.font = 'bold 16px sans-serif';
-     ctx.fillText(`Level: ${selfPlayer.level}`, canvas.width / 2, xpBarY - 8);
-
-
-     // Optional: Display Kill Count (Top Right)
-     ctx.fillStyle = '#ffffff';
-     ctx.textAlign = 'right';
-     ctx.font = '14px sans-serif';
-     ctx.fillText(`Kills: ${selfPlayer.killCount || 0}`, canvas.width - 15, 25);
-
-     // Optional: Draw simple crosshair?
-      ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
-      ctx.lineWidth = 1;
-      ctx.beginPath();
-      ctx.moveTo(mouseScreenX - 10, mouseScreenY);
-      ctx.lineTo(mouseScreenX + 10, mouseScreenY);
-      ctx.moveTo(mouseScreenX, mouseScreenY - 10);
-      ctx.lineTo(mouseScreenX, mouseScreenY + 10);
-      ctx.stroke();
+// Function to get player data suitable for sending to clients (omit ws object)
+function getPlayerDataForClient(player) {
+    return {
+        id: player.id,
+        name: player.name,
+        x: player.x,
+        y: player.y,
+        hp: player.hp,
+        maxHp: player.maxHp,
+        level: player.level,
+        xp: player.xp,
+        race: player.race,
+        classOrMutation: player.classOrMutation,
+        color: player.color,
+        radius: player.radius,
+        isDead: player.isDead,
+        canChooseLevel2: player.canChooseLevel2, // Send this flag to client
+        killCount: player.killCount // Send kill count for leaderboard
+    };
 }
 
 
-// --- Utility ---
-// Basic culling check (is the center of the element within the viewport + margin?)
-function isElementVisible(element, margin = 100) {
-     const screenX = element.x - camera.x + canvas.width / 2;
-     const screenY = element.y - camera.y + canvas.height / 2;
+// --- WebSocket Server Logic ---
+wss.on('connection', (ws) => {
+    const playerId = uuidv4();
+    console.log(`Client connected: ${playerId}`);
+    let currentPlayer = null; // Will be set on 'join'
 
-     return screenX > -margin &&
-            screenX < canvas.width + margin &&
-            screenY > -margin &&
-            screenY < canvas.height + margin;
+    ws.on('message', (message) => {
+        if (ws.readyState !== WebSocket.OPEN) return; // Ignore messages if connection is not open
+
+        try {
+            const data = JSON.parse(message);
+
+            switch (data.type) {
+                case 'join':
+                    if (!players.has(playerId)) {
+                         const name = data.name ? data.name.substring(0, 16) : 'Anon';
+                         const race = data.race || 'human';
+                         currentPlayer = createPlayer(playerId, ws, name, race);
+                         players.set(playerId, currentPlayer);
+                         console.log(`Player ${currentPlayer.name} (${currentPlayer.race}) joined with ID ${playerId}`);
+
+                        // Send initial state to the new player
+                        safeSend(ws, JSON.stringify({
+                            type: 'welcome',
+                            playerId: playerId,
+                            mapWidth: MAP_WIDTH,
+                            mapHeight: MAP_HEIGHT,
+                            initialState: { // Send current game state
+                                players: Array.from(players.values()).map(getPlayerDataForClient),
+                                orbs: Array.from(orbs.values()),
+                                projectiles: Array.from(projectiles.values())
+                            }
+                        }));
+                    }
+                    break;
+
+                case 'input':
+                    // Only update input if player exists, is not dead, and not choosing class
+                    if (currentPlayer && !currentPlayer.isDead && !currentPlayer.canChooseLevel2) {
+                         // Basic sanitization of input coordinates
+                         const mouseX = typeof data.input.mouseX === 'number' ? data.input.mouseX : 0;
+                         const mouseY = typeof data.input.mouseY === 'number' ? data.input.mouseY : 0;
+
+                         currentPlayer.lastInput = {
+                             up: !!data.input.up, // Ensure boolean
+                             down: !!data.input.down,
+                             left: !!data.input.left,
+                             right: !!data.input.right,
+                             attack: !!data.input.attack,
+                             mouseX: mouseX,
+                             mouseY: mouseY
+                         };
+                    } else if (currentPlayer) {
+                         // Clear input if player is dead or choosing class
+                          currentPlayer.lastInput = { up: false, down: false, left: false, right: false, attack: false, mouseX: 0, mouseY: 0 };
+                    }
+                    break;
+
+                 case 'selectClass':
+                     if (currentPlayer && currentPlayer.level === 2 && currentPlayer.canChooseLevel2 && data.choice) {
+                         // Basic validation of the choice
+                         const validChoices = ['warrior', 'mage', 'lord', 'higher', 'king', 'hobgoblin'];
+                         if (validChoices.includes(data.choice)) {
+                             applyLevel2Specialization(currentPlayer, data.choice);
+                             console.log(`${currentPlayer.name} chose: ${data.choice}`);
+                         } else {
+                             console.warn(`Invalid class selection for ${currentPlayer.name}: ${data.choice}`);
+                             // Optional: send an error back to the client
+                         }
+                     }
+                     break;
+
+                // Add other message types as needed (chat, etc.)
+            }
+        } catch (error) {
+            console.error('Failed to process message or invalid JSON:', message, error);
+        }
+    });
+
+    ws.on('close', () => {
+        console.log(`Client disconnected: ${playerId}`);
+        if (currentPlayer) {
+            players.delete(playerId);
+            console.log(`Player ${currentPlayer.name} removed.`);
+        }
+         // Maybe broadcast player disconnect to others?
+    });
+
+    ws.onerror = (error) => {
+        console.error(`WebSocket error for ${playerId}: `, error);
+         // Clean up player if connection breaks unexpectedly
+        if (currentPlayer) {
+            players.delete(playerId);
+            console.log(`Player ${currentPlayer.name} removed due to error.`);
+        }
+    };
+});
+
+// --- Static File Serving ---
+app.use(express.static(path.join(__dirname, 'public')));
+
+// --- Initialize Game ---
+// Spawn initial orbs
+for (let i = 0; i < ORB_COUNT * 0.8; i++) { // Start with 80% of orbs
+    spawnOrb();
 }
+// Start the game loop
+let lastUpdateTime = Date.now();
+setInterval(gameLoop, 1000 / 60); // ~60 FPS game logic update rate
 
-
-// --- Start the application ---
-init();
+// --- Start Server ---
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+    console.log(`Access the game at http://localhost:${PORT}`);
+});
