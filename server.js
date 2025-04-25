@@ -1,335 +1,267 @@
 // server.js
 const WebSocket = require('ws');
-const http = require('http');
 
-// --- Settings ---
+// --- Конфигурация и константы ---
 const PORT = process.env.PORT || 3000; // Важно для Render.com
-const TICK_RATE = 30; // Updates per second
+const TICK_RATE = 60; // Обновлений состояния в секунду
 const MAP_SIZE = 2000;
 const PLAYER_RADIUS = 20;
-const PLAYER_SPEED = 250 / TICK_RATE; // Pixels per tick
+const PLAYER_SPEED = 200 / TICK_RATE; // Пикселей за тик
 const BULLET_RADIUS = 8;
-const BULLET_SPEED = 500 / TICK_RATE; // Pixels per tick
-const BULLET_LIFESPAN = 1.5 * TICK_RATE; // Ticks
-const PLAYER_MAX_HEALTH = 100;
+const BULLET_SPEED = 450 / TICK_RATE; // Пикселей за тик
+const BULLET_LIFESPAN = 1.5 * TICK_RATE; // Время жизни пули в тиках
 const BULLET_DAMAGE = 10;
-const RESPAWN_TIME = 3 * 1000; // milliseconds
+const PLAYER_MAX_HP = 100;
+const SHOOT_COOLDOWN = 0.25 * TICK_RATE; // Тиков между выстрелами
+const RESPAWN_DELAY = 3 * TICK_RATE; // Тиков до респавна
 
-// --- Game State ---
-const players = {}; // { id: { x, y, angle, health, color, name, lastInputTime, dead, respawnTimer } }
-const bullets = {}; // { id: { x, y, angle, ownerId, life } }
+// --- Состояние игры ---
+let gameState = {
+    players: {}, // { id: { x, y, angle, hp, maxHp, color, lastShotTick, kills, dead, respawnTick } }
+    bullets: [], // { id, ownerId, x, y, angle, speed, radius, damage, ticksLeft }
+};
+let nextPlayerId = 0;
 let nextBulletId = 0;
+let currentTick = 0;
 
-// --- Helper Functions ---
-function generateId() {
-    return Math.random().toString(36).substring(2, 15);
-}
-
-function getRandomColor() {
-    const letters = '0123456789ABCDEF';
-    let color = '#';
-    for (let i = 0; i < 6; i++) {
-        color += letters[Math.floor(Math.random() * 16)];
-    }
-    return color;
-}
-
-function clamp(value, min, max) {
-    return Math.max(min, Math.min(max, value));
-}
-
-function distance(x1, y1, x2, y2) {
-    return Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
-}
-
-// --- Server Setup ---
-const server = http.createServer((req, res) => {
-    // Простая заглушка для HTTP запросов, если нужно будет отдавать HTML не через WS
-    res.writeHead(404);
-    res.end();
-});
-
-const wss = new WebSocket.Server({ server });
-
+// --- WebSocket Сервер ---
+const wss = new WebSocket.Server({ port: PORT });
 console.log(`WebSocket server started on port ${PORT}`);
 
 wss.on('connection', (ws) => {
-    const playerId = generateId();
-    const player = {
-        id: playerId,
-        x: Math.random() * (MAP_SIZE - 100) + 50,
-        y: Math.random() * (MAP_SIZE - 100) + 50,
-        angle: 0,
-        health: PLAYER_MAX_HEALTH,
-        color: getRandomColor(),
-        name: "Player " + Math.floor(Math.random() * 1000),
-        inputs: { left: false, right: false, up: false, down: false },
-        mouse: { x: 0, y: 0, down: false },
-        lastUpdateTime: Date.now(),
-        dead: false,
-        respawnTimer: null,
-        score: 0, // Добавим счет
-    };
-    players[playerId] = player;
-    ws.playerId = playerId; // Связываем ID с WebSocket соединением
+    const playerId = nextPlayerId++;
+    console.log(`Player ${playerId} connected.`);
 
-    console.log(`Player ${playerId} (${player.name}) connected.`);
+    // --- Инициализация нового игрока ---
+    const startX = Math.random() * (MAP_SIZE - 100) + 50;
+    const startY = Math.random() * (MAP_SIZE - 100) + 50;
+    const startColor = `hsl(${Math.random() * 360}, 70%, 60%)`;
+
+    gameState.players[playerId] = {
+        id: playerId,
+        x: startX,
+        y: startY,
+        radius: PLAYER_RADIUS,
+        angle: 0, // Угол пушки (направление взгляда)
+        hp: PLAYER_MAX_HP,
+        maxHp: PLAYER_MAX_HP,
+        color: startColor,
+        kills: 0,
+        keys: {}, // { w: false, a: false, s: false, d: false }
+        isShooting: false,
+        lastShotTick: 0,
+        dead: false,
+        respawnTick: 0,
+    };
+    ws.playerId = playerId; // Сохраняем ID для легкого доступа при дисконнекте
 
     // Отправляем новому игроку его ID и текущее состояние игры
-    ws.send(JSON.stringify({
-        type: 'init',
-        payload: {
-            playerId: playerId,
-            players: players,
-            bullets: bullets,
-            settings: { MAP_SIZE, PLAYER_RADIUS, BULLET_RADIUS, PLAYER_MAX_HEALTH }
-        }
-    }));
+    ws.send(JSON.stringify({ type: 'init', payload: { id: playerId, initialState: gameState } }));
 
-    // Оповещаем всех остальных о новом игроке
-    broadcast({
-        type: 'playerJoined',
-        payload: { player: players[playerId] }
-    }, ws); // Отправляем всем, кроме нового игрока
-
+    // --- Обработка сообщений от клиента ---
     ws.on('message', (message) => {
         try {
             const data = JSON.parse(message);
-            const player = players[ws.playerId];
-            if (!player || player.dead) return; // Игнорировать ввод от мертвого или несуществующего игрока
-
-            player.lastUpdateTime = Date.now(); // Обновляем время активности
+            const player = gameState.players[playerId];
+            if (!player || player.dead) return; // Не обрабатывать сообщения от мертвых или несуществующих
 
             switch (data.type) {
                 case 'input':
-                    player.inputs = data.payload.keys;
-                    player.mouse = data.payload.mouse;
-                    // Обновляем угол игрока на сервере
-                    player.angle = Math.atan2(player.mouse.y - player.y, player.mouse.x - player.x);
-                    break;
-                case 'shoot':
-                    if (!player.dead) {
-                        spawnBullet(player);
+                    // Обновляем состояние клавиш и угла прицеливания
+                    if (data.payload.keys) {
+                        player.keys = data.payload.keys;
+                    }
+                    if (typeof data.payload.angle === 'number') {
+                         // Ограничиваем угол для безопасности
+                        player.angle = Math.max(-Math.PI, Math.min(Math.PI, data.payload.angle));
+                    }
+                    if (typeof data.payload.shooting === 'boolean') {
+                        player.isShooting = data.payload.shooting;
                     }
                     break;
-                case 'setName':
-                    if (data.payload && typeof data.payload.name === 'string') {
-                        player.name = data.payload.name.substring(0, 16); // Ограничиваем длину имени
-                        broadcast({ type: 'nameUpdate', payload: { id: playerId, name: player.name } });
-                    }
-                    break;
-                case 'ping': // Для замера задержки (не обязательно)
-                    ws.send(JSON.stringify({ type: 'pong' }));
-                    break;
+                // Можно добавить другие типы сообщений (чат и т.д.)
             }
         } catch (error) {
-            console.error('Failed to process message:', message, error);
+            console.error('Failed to parse message or invalid message format:', message, error);
         }
     });
 
+    // --- Обработка отключения клиента ---
     ws.on('close', () => {
-        console.log(`Player ${ws.playerId} disconnected.`);
-        const disconnectedPlayer = players[ws.playerId];
-        delete players[ws.playerId];
-        // Оповещаем всех остальных об отключении
-        broadcast({
-            type: 'playerLeft',
-            payload: { id: ws.playerId, name: disconnectedPlayer ? disconnectedPlayer.name : 'Unknown' }
-        });
+        console.log(`Player ${playerId} disconnected.`);
+        delete gameState.players[playerId];
+        // Можно добавить broadcast об отключении другим игрокам
+        broadcast({ type: 'player_left', payload: { id: playerId } });
     });
 
-    ws.on('error', (error) => {
-        console.error(`WebSocket error for player ${ws.playerId}:`, error);
-        // Можно также обработать отключение здесь
-        if (players[ws.playerId]) {
-             const disconnectedPlayer = players[ws.playerId];
-             delete players[ws.playerId];
-             broadcast({ type: 'playerLeft', payload: { id: ws.playerId, name: disconnectedPlayer ? disconnectedPlayer.name : 'Unknown' } });
+     ws.on('error', (error) => {
+        console.error(`WebSocket error for player ${playerId}:`, error);
+        // Попробуем корректно удалить игрока при ошибке
+        if (gameState.players[playerId]) {
+            delete gameState.players[playerId];
+            broadcast({ type: 'player_left', payload: { id: playerId } });
         }
     });
 });
 
-function spawnBullet(player) {
-    const bulletId = `b${nextBulletId++}`;
+// --- Главный игровой цикл (Game Loop) ---
+function gameLoop() {
+    currentTick++;
+
+    // --- Обновление состояния ---
+    updatePlayers();
+    updateBullets();
+    checkCollisions();
+    handleRespawns();
+
+    // --- Рассылка состояния всем клиентам ---
+    // Оптимизация: можно отправлять только изменения (дельты), но для простоты шлем всё
+    broadcast({ type: 'update', payload: gameState });
+
+    // --- Запуск следующего тика ---
+    // Используем setTimeout вместо setInterval для большей точности при нагрузке
+    setTimeout(gameLoop, 1000 / TICK_RATE);
+}
+
+// --- Вспомогательные функции обновления ---
+
+function updatePlayers() {
+    for (const id in gameState.players) {
+        const player = gameState.players[id];
+        if (player.dead) continue;
+
+        // Движение
+        let dx = 0;
+        let dy = 0;
+        if (player.keys.w) dy -= PLAYER_SPEED;
+        if (player.keys.s) dy += PLAYER_SPEED;
+        if (player.keys.a) dx -= PLAYER_SPEED;
+        if (player.keys.d) dx += PLAYER_SPEED;
+
+        // Нормализация диагонального движения (чтобы не было быстрее)
+        if (dx !== 0 && dy !== 0) {
+            const magnitude = Math.sqrt(dx * dx + dy * dy);
+            dx = (dx / magnitude) * PLAYER_SPEED;
+            dy = (dy / magnitude) * PLAYER_SPEED;
+        }
+
+        player.x += dx;
+        player.y += dy;
+
+        // Ограничение по карте
+        player.x = Math.max(player.radius, Math.min(MAP_SIZE - player.radius, player.x));
+        player.y = Math.max(player.radius, Math.min(MAP_SIZE - player.radius, player.y));
+
+        // Стрельба
+        if (player.isShooting && currentTick - player.lastShotTick >= SHOOT_COOLDOWN) {
+            player.lastShotTick = currentTick;
+            createBullet(player);
+        }
+    }
+}
+
+function createBullet(player) {
+    const bulletId = nextBulletId++;
     const bullet = {
         id: bulletId,
         ownerId: player.id,
-        x: player.x + Math.cos(player.angle) * (PLAYER_RADIUS + BULLET_RADIUS + 1),
-        y: player.y + Math.sin(player.angle) * (PLAYER_RADIUS + BULLET_RADIUS + 1),
+        x: player.x + Math.cos(player.angle) * (player.radius + BULLET_RADIUS + 1), // Позиция чуть впереди пушки
+        y: player.y + Math.sin(player.angle) * (player.radius + BULLET_RADIUS + 1),
+        radius: BULLET_RADIUS,
         angle: player.angle,
-        life: BULLET_LIFESPAN
+        speed: BULLET_SPEED,
+        damage: BULLET_DAMAGE,
+        ticksLeft: BULLET_LIFESPAN,
     };
-    bullets[bulletId] = bullet;
+    gameState.bullets.push(bullet);
 }
 
-function updatePlayerPosition(player, dt) {
-    let dx = 0;
-    let dy = 0;
-    if (player.inputs.left) dx -= 1;
-    if (player.inputs.right) dx += 1;
-    if (player.inputs.up) dy -= 1;
-    if (player.inputs.down) dy += 1;
+function updateBullets() {
+    gameState.bullets = gameState.bullets.filter(bullet => {
+        bullet.x += Math.cos(bullet.angle) * bullet.speed;
+        bullet.y += Math.sin(bullet.angle) * bullet.speed;
+        bullet.ticksLeft--;
 
-    // Нормализация диагонального движения
-    const magnitude = Math.sqrt(dx * dx + dy * dy);
-    if (magnitude > 0) {
-        dx = (dx / magnitude);
-        dy = (dy / magnitude);
-    }
-
-    player.x += dx * PLAYER_SPEED;
-    player.y += dy * PLAYER_SPEED;
-
-    // Ограничение по карте
-    player.x = clamp(player.x, PLAYER_RADIUS, MAP_SIZE - PLAYER_RADIUS);
-    player.y = clamp(player.y, PLAYER_RADIUS, MAP_SIZE - PLAYER_RADIUS);
-}
-
-function updateBulletPosition(bullet, dt) {
-    bullet.x += Math.cos(bullet.angle) * BULLET_SPEED;
-    bullet.y += Math.sin(bullet.angle) * BULLET_SPEED;
-    bullet.life -= 1;
+        // Удаляем пули за границами карты или с истекшим временем жизни
+        return bullet.ticksLeft > 0 &&
+               bullet.x > -bullet.radius && bullet.x < MAP_SIZE + bullet.radius &&
+               bullet.y > -bullet.radius && bullet.y < MAP_SIZE + bullet.radius;
+    });
 }
 
 function checkCollisions() {
-    const bulletIds = Object.keys(bullets);
-    const playerIds = Object.keys(players);
+    const bulletsToRemove = new Set();
 
-    for (const bulletId of bulletIds) {
-        const bullet = bullets[bulletId];
-        if (!bullet) continue;
+    for (let i = gameState.bullets.length - 1; i >= 0; i--) {
+        const bullet = gameState.bullets[i];
+        if (bulletsToRemove.has(bullet.id)) continue;
 
-        // Столкновение пули со стенами
-        if (bullet.x < 0 || bullet.x > MAP_SIZE || bullet.y < 0 || bullet.y > MAP_SIZE || bullet.life <= 0) {
-            delete bullets[bulletId];
-            continue;
-        }
+        for (const playerId in gameState.players) {
+            const player = gameState.players[playerId];
+            // Нельзя попасть в себя, в мертвых или в игроков на респавне
+            if (player.id === bullet.ownerId || player.dead) continue;
 
-        // Столкновение пули с игроками
-        for (const playerId of playerIds) {
-            const player = players[playerId];
-            if (!player || player.dead || player.id === bullet.ownerId) continue; // Не сталкиваться с собой или мертвыми
+            const dx = player.x - bullet.x;
+            const dy = player.y - bullet.y;
+            const distanceSq = dx * dx + dy * dy; // Сравниваем квадраты для оптимизации (избегаем sqrt)
+            const radiiSumSq = (player.radius + bullet.radius) * (player.radius + bullet.radius);
 
-            const dist = distance(bullet.x, bullet.y, player.x, player.y);
-            if (dist < PLAYER_RADIUS + BULLET_RADIUS) {
-                player.health -= BULLET_DAMAGE;
-                delete bullets[bulletId]; // Пуля исчезает
+            if (distanceSq < radiiSumSq) {
+                // Попадание!
+                player.hp -= bullet.damage;
+                bulletsToRemove.add(bullet.id); // Помечаем пулю на удаление
 
-                if (player.health <= 0) {
-                    console.log(`Player ${player.id} (${player.name}) killed by ${bullet.ownerId}`);
+                if (player.hp <= 0) {
+                    player.hp = 0;
                     player.dead = true;
-                    player.health = 0;
-                    // Добавляем очки убийце
-                    if (players[bullet.ownerId]) {
-                        players[bullet.ownerId].score += 1; // Увеличиваем счет убийцы
-                    }
-                    // Запускаем таймер респавна
-                    player.respawnTimer = setTimeout(() => {
-                        respawnPlayer(player);
-                    }, RESPAWN_TIME);
+                    player.respawnTick = currentTick + RESPAWN_DELAY;
+                    console.log(`Player ${player.id} killed by Player ${bullet.ownerId}`);
 
-                    // Оповещаем всех о смерти и обновлении счета
-                    broadcast({ type: 'playerDied', payload: { victimId: player.id, killerId: bullet.ownerId, killerScore: players[bullet.ownerId]?.score ?? 0 } });
-                } else {
-                     // Оповещаем об изменении здоровья
-                     broadcast({ type: 'healthUpdate', payload: { id: player.id, health: player.health }});
+                    // Даем килл стрелявшему, если он еще существует
+                    const killer = gameState.players[bullet.ownerId];
+                    if (killer) {
+                        killer.kills++;
+                    }
+                    // Можно добавить broadcast о смерти
+                    broadcast({ type: 'player_died', payload: { victimId: player.id, killerId: bullet.ownerId } });
                 }
-                break; // Пуля может поразить только одного игрока
+                // Выходим из внутреннего цикла, т.к. пуля уже попала
+                break;
             }
         }
     }
+    // Удаляем пули, которые попали
+     if (bulletsToRemove.size > 0) {
+        gameState.bullets = gameState.bullets.filter(bullet => !bulletsToRemove.has(bullet.id));
+    }
 }
 
-function respawnPlayer(player) {
-    if (!players[player.id]) return; // Игрок мог отключиться
-
-    player.x = Math.random() * (MAP_SIZE - 100) + 50;
-    player.y = Math.random() * (MAP_SIZE - 100) + 50;
-    player.health = PLAYER_MAX_HEALTH;
-    player.dead = false;
-    player.respawnTimer = null;
-    console.log(`Player ${player.id} respawned.`);
-
-    // Оповещаем всех о респавне
-    broadcast({ type: 'playerRespawned', payload: { player: player } });
+function handleRespawns() {
+     for (const id in gameState.players) {
+        const player = gameState.players[id];
+        if (player.dead && currentTick >= player.respawnTick) {
+            player.dead = false;
+            player.hp = player.maxHp;
+            player.x = Math.random() * (MAP_SIZE - 100) + 50;
+            player.y = Math.random() * (MAP_SIZE - 100) + 50;
+            player.keys = {}; // Сброс нажатых клавиш
+            player.isShooting = false;
+             console.log(`Player ${player.id} respawned.`);
+             // Можно добавить broadcast о респавне
+            broadcast({ type: 'player_respawn', payload: { id: player.id, x: player.x, y: player.y, hp: player.hp } });
+        }
+    }
 }
 
-// --- Game Loop ---
-function gameLoop() {
-    const now = Date.now();
-    const dt = (now - (lastUpdateTime || now)) / 1000; // Delta time in seconds (не используется пока, но полезно)
-    lastUpdateTime = now;
-
-    // Update players
-    for (const playerId in players) {
-        const player = players[playerId];
-        if (player.dead) continue;
-        updatePlayerPosition(player, dt);
-         // Обновляем угол игрока (можно делать и здесь, если не обновлять по каждому движению мыши)
-        // player.angle = Math.atan2(player.mouse.y - player.y, player.mouse.x - player.x);
-    }
-
-    // Update bullets
-    for (const bulletId in bullets) {
-        updateBulletPosition(bullets[bulletId], dt);
-    }
-
-    // Check collisions
-    checkCollisions();
-
-    // Prepare state for broadcast
-    const gameState = {
-        players: {},
-        bullets: bullets // Можно отправлять все пули или только изменения
-    };
-    // Отправляем только нужные данные об игроках
-    for (const pId in players) {
-        const p = players[pId];
-        gameState.players[pId] = {
-            x: p.x,
-            y: p.y,
-            angle: p.angle,
-            color: p.color,
-            name: p.name,
-            health: p.health,
-            dead: p.dead,
-            score: p.score // Добавляем счет
-        };
-    }
-
-    // Broadcast game state to all clients
-    broadcast({ type: 'update', payload: gameState });
-
-    // Проверка неактивных игроков (опционально)
-    const kickTimeout = 60000; // 1 минута неактивности
-     for (const playerId in players) {
-         if (now - players[playerId].lastUpdateTime > kickTimeout) {
-            const wsToKick = Array.from(wss.clients).find(client => client.playerId === playerId);
-             if (wsToKick) {
-                 console.log(`Kicking inactive player ${playerId}`);
-                 wsToKick.close(1000, "Kicked due to inactivity"); // Закрываем соединение
-             }
-             // Удаление произойдет в ws.on('close')
-         }
-     }
-
-}
-
-let lastUpdateTime = Date.now();
-setInterval(gameLoop, 1000 / TICK_RATE);
-
-// --- Broadcast Function ---
-function broadcast(message, senderWs = null) {
+// --- Функция рассылки сообщений всем клиентам ---
+function broadcast(message) {
     const messageString = JSON.stringify(message);
     wss.clients.forEach((client) => {
-        // Отправляем всем, кроме senderWs, если он указан
-        if (client !== senderWs && client.readyState === WebSocket.OPEN) {
+        if (client.readyState === WebSocket.OPEN) {
             client.send(messageString);
         }
     });
 }
 
-// --- Start Server ---
-server.listen(PORT, () => {
-    console.log(`HTTP server listening on port ${PORT} (for WebSocket upgrades)`);
-});
+// --- Запуск игрового цикла ---
+gameLoop();
