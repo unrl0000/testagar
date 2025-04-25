@@ -1,0 +1,632 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>dipper.io</title>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+            background-color: #333;
+            font-family: Arial, sans-serif;
+            color: white;
+        }
+        #gameCanvas {
+            display: block; /* Убирает отступы под canvas */
+            background-color: #f0f0f0;
+            position: absolute;
+            top: 0;
+            left: 0;
+        }
+        #startScreen {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background-color: rgba(0, 0, 0, 0.7);
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            z-index: 10;
+        }
+        #startScreen input {
+            padding: 10px;
+            font-size: 1.2em;
+            margin-bottom: 15px;
+            width: 200px;
+            text-align: center;
+        }
+        #startScreen button {
+            padding: 12px 25px;
+            font-size: 1.3em;
+            cursor: pointer;
+            background-color: #4CAF50;
+            color: white;
+            border: none;
+            border-radius: 5px;
+        }
+         #startScreen button:hover {
+             background-color: #45a049;
+         }
+         #hud {
+             position: absolute;
+             bottom: 10px;
+             left: 10px;
+             background-color: rgba(0,0,0,0.5);
+             padding: 8px;
+             border-radius: 4px;
+             font-size: 14px;
+         }
+         #leaderboard {
+             position: absolute;
+             top: 10px;
+             right: 10px;
+             background-color: rgba(0,0,0,0.5);
+             padding: 10px;
+             border-radius: 4px;
+             min-width: 150px;
+         }
+         #leaderboard h3 {
+             margin: 0 0 5px 0;
+             text-align: center;
+             font-size: 16px;
+         }
+         #leaderboard ol {
+             margin: 0;
+             padding-left: 20px; /* Для нумерации */
+             font-size: 14px;
+         }
+         #leaderboard li {
+              margin-bottom: 3px;
+         }
+         .player-name {
+             position: absolute; /* Для позиционирования над игроком */
+             color: white;
+             background-color: rgba(0,0,0,0.6);
+             padding: 2px 4px;
+             font-size: 10px;
+             border-radius: 2px;
+             white-space: nowrap;
+             text-align: center;
+             transform: translateX(-50%); /* Центрирование */
+         }
+         #deathMessage {
+             position: absolute;
+             top: 40%;
+             left: 50%;
+             transform: translate(-50%, -50%);
+             color: red;
+             font-size: 2em;
+             font-weight: bold;
+             background-color: rgba(0,0,0,0.7);
+             padding: 20px;
+             border-radius: 10px;
+             display: none; /* Скрыто по умолчанию */
+             text-align: center;
+             z-index: 5;
+         }
+    </style>
+</head>
+<body>
+    <div id="startScreen">
+        <h1>dipper.io</h1>
+        <input type="text" id="playerNameInput" placeholder="Enter your name" maxlength="16">
+        <button id="startButton">Play</button>
+    </div>
+
+    <canvas id="gameCanvas"></canvas>
+    <div id="hud">Health: <span id="healthValue">100</span> / 100</div>
+    <div id="leaderboard">
+        <h3>Leaderboard</h3>
+        <ol id="leaderboardList"></ol>
+    </div>
+     <div id="deathMessage">You Died!<br><span style="font-size: 0.7em;">Respawning soon...</span></div>
+
+    <script>
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const startScreen = document.getElementById('startScreen');
+        const playerNameInput = document.getElementById('playerNameInput');
+        const startButton = document.getElementById('startButton');
+        const hudHealth = document.getElementById('healthValue');
+        const leaderboardList = document.getElementById('leaderboardList');
+        const deathMessage = document.getElementById('deathMessage');
+
+
+        let ws;
+        let players = {};
+        let bullets = {};
+        let settings = {};
+        let playerId = null;
+        let lastServerUpdateTime = 0;
+        let gameStarted = false;
+        let cameraX = 0;
+        let cameraY = 0;
+
+        const inputs = {
+            left: false,
+            right: false,
+            up: false,
+            down: false,
+        };
+        const mouse = {
+            x: 0, // Координаты мыши относительно канваса
+            y: 0,
+            worldX: 0, // Координаты мыши в игровом мире
+            worldY: 0,
+            down: false
+        };
+
+        function resizeCanvas() {
+            canvas.width = window.innerWidth;
+            canvas.height = window.innerHeight;
+        }
+        window.addEventListener('resize', resizeCanvas);
+        resizeCanvas(); // Initial size
+
+        // --- WebSocket Connection ---
+        function connectWebSocket() {
+            // Определяем протокол (ws или wss)
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+            // Берем хост и порт из текущего URL (удобно для Render)
+            const wsUrl = `${wsProtocol}//${window.location.host}`;
+
+            console.log(`Connecting to WebSocket at ${wsUrl}`);
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connection established.');
+                // Отправляем имя игрока сразу после подключения
+                 const name = playerNameInput.value.trim() || "Player " + Math.floor(Math.random() * 1000);
+                 send({ type: 'setName', payload: { name: name } });
+                gameStarted = true;
+                requestAnimationFrame(gameLoop); // Начинаем игровой цикл
+                 startScreen.style.display = 'none'; // Скрываем стартовый экран
+                 canvas.style.display = 'block'; // Показываем канвас
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const message = JSON.parse(event.data);
+                    handleMessage(message);
+                } catch (error) {
+                    console.error('Failed to parse message or handle:', event.data, error);
+                }
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                alert('Connection error. Please refresh the page.');
+                 gameStarted = false;
+                 startScreen.style.display = 'flex'; // Показываем стартовый экран при ошибке
+            };
+
+            ws.onclose = (event) => {
+                console.log('WebSocket connection closed:', event.reason || `Code: ${event.code}`);
+                gameStarted = false;
+                alert(`Connection closed: ${event.reason || 'Unknown reason'}. Please refresh.`);
+                startScreen.style.display = 'flex';
+                deathMessage.style.display = 'none'; // Скрыть сообщение о смерти
+                 // Очистка состояния игры
+                 players = {};
+                 bullets = {};
+                 playerId = null;
+            };
+        }
+
+        // --- Message Handling ---
+        function handleMessage(message) {
+            switch (message.type) {
+                case 'init':
+                    playerId = message.payload.playerId;
+                    players = message.payload.players; // Получаем всех игроков
+                    bullets = message.payload.bullets;
+                    settings = message.payload.settings;
+                    console.log('Game initialized. Player ID:', playerId);
+                    break;
+                case 'update':
+                    // Просто заменяем состояние (простой подход)
+                    players = message.payload.players;
+                    bullets = message.payload.bullets;
+                    lastServerUpdateTime = Date.now();
+                    updateHUD();
+                    updateLeaderboard();
+                    checkPlayerDeathStatus();
+                    break;
+                case 'playerJoined':
+                    players[message.payload.player.id] = message.payload.player; // Добавляем нового
+                     console.log(`Player ${message.payload.player.name} joined`);
+                    break;
+                case 'playerLeft':
+                     const leftPlayerName = players[message.payload.id]?.name || message.payload.name;
+                     console.log(`Player ${leftPlayerName} (${message.payload.id}) left`);
+                    delete players[message.payload.id]; // Удаляем ушедшего
+                    updateLeaderboard(); // Обновляем лидерборд
+                    break;
+                 case 'nameUpdate':
+                      if (players[message.payload.id]) {
+                          players[message.payload.id].name = message.payload.name;
+                          updateLeaderboard();
+                      }
+                      break;
+                 case 'healthUpdate': // Обновление здоровья конкретного игрока
+                     if (players[message.payload.id]) {
+                         players[message.payload.id].health = message.payload.health;
+                         if (message.payload.id === playerId) {
+                             hudHealth.textContent = message.payload.health;
+                         }
+                     }
+                     break;
+                 case 'playerDied':
+                     if (players[message.payload.victimId]) {
+                         players[message.payload.victimId].dead = true;
+                         players[message.payload.victimId].health = 0;
+                         console.log(`Player ${message.payload.victimId} died.`);
+                         if (message.payload.victimId === playerId) {
+                             deathMessage.style.display = 'block'; // Показываем сообщение о смерти
+                             hudHealth.textContent = 0;
+                         }
+                     }
+                      // Обновляем счет убийцы
+                      if (players[message.payload.killerId] && message.payload.killerScore !== undefined) {
+                          players[message.payload.killerId].score = message.payload.killerScore;
+                          updateLeaderboard();
+                      }
+                     break;
+                 case 'playerRespawned':
+                     const respawnedPlayer = message.payload.player;
+                      if (players[respawnedPlayer.id]) {
+                          // Обновляем данные возрожденного игрока
+                           Object.assign(players[respawnedPlayer.id], {
+                               x: respawnedPlayer.x,
+                               y: respawnedPlayer.y,
+                               health: respawnedPlayer.health,
+                               dead: false,
+                               // score не сбрасываем здесь, сервер управляет счетом
+                           });
+                          console.log(`Player ${respawnedPlayer.id} respawned.`);
+                          if (respawnedPlayer.id === playerId) {
+                               deathMessage.style.display = 'none'; // Скрываем сообщение
+                               hudHealth.textContent = respawnedPlayer.health;
+                          }
+                      } else {
+                          // Если игрок переподключился во время респавна (маловероятно, но возможно)
+                          players[respawnedPlayer.id] = respawnedPlayer;
+                      }
+                     break;
+                 case 'pong': // Ответ на пинг (не используется активно здесь)
+                    // console.log('Pong received');
+                    break;
+                default:
+                    console.warn('Unknown message type:', message.type);
+            }
+        }
+
+        // --- Sending Data ---
+        function send(data) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+            }
+        }
+
+        // --- Input Handling ---
+        function handleKeyDown(e) {
+            if (!gameStarted) return;
+            switch (e.code) {
+                case 'KeyA':
+                case 'ArrowLeft': inputs.left = true; break;
+                case 'KeyD':
+                case 'ArrowRight': inputs.right = true; break;
+                case 'KeyW':
+                case 'ArrowUp': inputs.up = true; break;
+                case 'KeyS':
+                case 'ArrowDown': inputs.down = true; break;
+            }
+            sendInput(); // Отправляем сразу при нажатии
+        }
+
+        function handleKeyUp(e) {
+            if (!gameStarted) return;
+            switch (e.code) {
+                case 'KeyA':
+                case 'ArrowLeft': inputs.left = false; break;
+                case 'KeyD':
+                case 'ArrowRight': inputs.right = false; break;
+                case 'KeyW':
+                case 'ArrowUp': inputs.up = false; break;
+                case 'KeyS':
+                case 'ArrowDown': inputs.down = false; break;
+            }
+             sendInput(); // Отправляем сразу при отпускании
+        }
+
+        function handleMouseMove(e) {
+             if (!gameStarted) return;
+            mouse.x = e.clientX;
+            mouse.y = e.clientY;
+             // Преобразуем координаты мыши в мировые координаты
+            if (players[playerId]) {
+                mouse.worldX = mouse.x - canvas.width / 2 + cameraX;
+                mouse.worldY = mouse.y - canvas.height / 2 + cameraY;
+            }
+            // Отправку угла лучше делать на сервере при получении инпута
+            // sendInput(); // Можно отправлять реже, например, в gameLoop
+        }
+
+        function handleMouseDown(e) {
+             if (!gameStarted || !players[playerId] || players[playerId].dead) return;
+            if (e.button === 0) { // Левая кнопка мыши
+                mouse.down = true;
+                send({ type: 'shoot' }); // Отправляем команду выстрела
+            }
+        }
+
+        function handleMouseUp(e) {
+             if (!gameStarted) return;
+            if (e.button === 0) {
+                mouse.down = false;
+                 // sendInput(); // Обновляем состояние мыши на сервере
+            }
+        }
+
+        // Отправка состояния ввода на сервер
+        let lastInputSendTime = 0;
+        const inputSendInterval = 50; // ms ( ~20 раз в секунду)
+
+        function sendInput() {
+             const now = Date.now();
+             // if (now - lastInputSendTime > inputSendInterval) { // Можно добавить троттлинг
+                if (!players[playerId] || players[playerId].dead) return; // Не отправлять, если мертв
+                send({
+                    type: 'input',
+                    payload: {
+                        keys: inputs,
+                        // Отправляем мировые координаты мыши
+                        mouse: { x: mouse.worldX, y: mouse.worldY }
+                     }
+                });
+            //     lastInputSendTime = now;
+            // }
+        }
+
+
+        window.addEventListener('keydown', handleKeyDown);
+        window.addEventListener('keyup', handleKeyUp);
+        window.addEventListener('mousemove', handleMouseMove);
+        window.addEventListener('mousedown', handleMouseDown);
+        window.addEventListener('mouseup', handleMouseUp);
+        // Предотвращаем контекстное меню
+        window.addEventListener('contextmenu', (e) => e.preventDefault());
+
+
+        // --- Start Button ---
+        startButton.addEventListener('click', () => {
+            playerNameInput.disabled = true;
+            startButton.disabled = true;
+            startButton.textContent = 'Connecting...';
+            connectWebSocket();
+        });
+         // Позволяем начать игру по Enter в поле имени
+         playerNameInput.addEventListener('keypress', (e) => {
+             if (e.key === 'Enter') {
+                 startButton.click();
+             }
+         });
+
+        // --- Game Loop (Client-side Rendering) ---
+        function gameLoop(timestamp) {
+            if (!gameStarted || !playerId) {
+                // Отображаем стартовый экран или сообщение об ошибке/отключении
+                return;
+            }
+
+             // Отправка инпута с некоторой частотой (если не отправляли по событиям)
+             // sendInput();
+
+            // --- Update camera ---
+            const player = players[playerId];
+            if (player && !player.dead) {
+                // Плавное следование камеры (опционально)
+                const lerpFactor = 0.1;
+                cameraX += (player.x - cameraX) * lerpFactor;
+                cameraY += (player.y - cameraY) * lerpFactor;
+                 // Или простое следование:
+                 // cameraX = player.x;
+                 // cameraY = player.y;
+
+                 // Обновляем мировые координаты мыши на основе положения камеры
+                 mouse.worldX = mouse.x - canvas.width / 2 + cameraX;
+                 mouse.worldY = mouse.y - canvas.height / 2 + cameraY;
+
+                 // Периодически отправляем инпут, чтобы сервер знал актуальный угол мыши
+                 sendInput();
+
+            } else if (player && player.dead) {
+                // Камера остается на месте смерти или следует за "призраком"? Пока оставим.
+            } else {
+                 // Игрок еще не инициализирован? Центрируем на 0,0 или ждем
+                 cameraX = settings.MAP_SIZE / 2;
+                 cameraY = settings.MAP_SIZE / 2;
+            }
+
+
+            // --- Clear Canvas ---
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // --- Set background ---
+            ctx.fillStyle = '#e0e0e0'; // Светло-серый фон
+            ctx.fillRect(0, 0, canvas.width, canvas.height);
+
+            // --- Translate to Camera View ---
+            ctx.save();
+            ctx.translate(canvas.width / 2 - cameraX, canvas.height / 2 - cameraY);
+
+            // --- Draw Grid (Optional) ---
+            drawGrid();
+
+            // --- Draw Map Boundaries ---
+             ctx.strokeStyle = '#888';
+             ctx.lineWidth = 5;
+             ctx.strokeRect(0, 0, settings.MAP_SIZE, settings.MAP_SIZE);
+
+            // --- Draw Bullets ---
+             ctx.fillStyle = '#555'; // Темно-серые пули
+            for (const id in bullets) {
+                const bullet = bullets[id];
+                ctx.beginPath();
+                ctx.arc(bullet.x, bullet.y, settings.BULLET_RADIUS, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            // --- Draw Players ---
+            const playerIdsSorted = Object.keys(players).sort((a, b) => {
+                // Рисуем текущего игрока последним (поверх остальных)
+                 if (a === playerId) return 1;
+                 if (b === playerId) return -1;
+                 return 0; // Порядок остальных не важен
+            });
+
+            for (const id of playerIdsSorted) {
+                 const p = players[id];
+                 if (p.dead) continue; // Не рисуем мертвых (или рисуем как призраков?)
+
+                 ctx.save();
+                 ctx.translate(p.x, p.y);
+
+                 // Draw Tank Body
+                 ctx.fillStyle = p.color;
+                 ctx.strokeStyle = darkenColor(p.color, 0.7); // Более темный контур
+                 ctx.lineWidth = 3;
+                 ctx.beginPath();
+                 ctx.arc(0, 0, settings.PLAYER_RADIUS, 0, Math.PI * 2);
+                 ctx.fill();
+                 ctx.stroke();
+
+                 // Draw Turret
+                  ctx.rotate(p.angle); // Поворачиваем башню
+                  ctx.fillStyle = '#999'; // Серая башня
+                  ctx.strokeStyle = '#666';
+                  ctx.lineWidth = 2;
+                  const turretWidth = settings.PLAYER_RADIUS * 1.5;
+                  const turretHeight = settings.PLAYER_RADIUS * 0.8;
+                  ctx.fillRect(0, -turretHeight / 2, turretWidth, turretHeight);
+                  ctx.strokeRect(0, -turretHeight / 2, turretWidth, turretHeight);
+
+                  ctx.restore(); // Восстанавливаем контекст (убираем translate и rotate)
+
+                 // Draw Health Bar above player
+                 const healthBarWidth = settings.PLAYER_RADIUS * 2;
+                 const healthBarHeight = 8;
+                 const healthBarX = p.x - healthBarWidth / 2;
+                 const healthBarY = p.y - settings.PLAYER_RADIUS - healthBarHeight - 5; // Над игроком
+                 const healthPercentage = p.health / settings.PLAYER_MAX_HEALTH;
+
+                 ctx.fillStyle = '#ddd'; // Фон полоски
+                 ctx.fillRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
+                 ctx.fillStyle = healthPercentage > 0.5 ? '#00cc00' : (healthPercentage > 0.2 ? '#ffcc00' : '#ff3300'); // Зеленый/Желтый/Красный
+                 ctx.fillRect(healthBarX, healthBarY, healthBarWidth * healthPercentage, healthBarHeight);
+                 ctx.strokeStyle = '#555';
+                 ctx.lineWidth = 1;
+                 ctx.strokeRect(healthBarX, healthBarY, healthBarWidth, healthBarHeight);
+
+                 // Draw Player Name below player
+                 ctx.fillStyle = 'black';
+                 ctx.font = '12px Arial';
+                 ctx.textAlign = 'center';
+                 ctx.fillText(p.name, p.x, p.y + settings.PLAYER_RADIUS + 15); // Под игроком
+            }
+
+            // --- Restore Context ---
+            ctx.restore(); // Отменяем translate камеры
+
+            // --- Request Next Frame ---
+            requestAnimationFrame(gameLoop);
+        }
+
+         function drawGrid() {
+             const gridSize = 50;
+             ctx.strokeStyle = '#d0d0d0'; // Цвет сетки
+             ctx.lineWidth = 1;
+
+             // Оптимизация: рисуем сетку только в видимой области
+            const startX = Math.floor((cameraX - canvas.width / 2) / gridSize) * gridSize;
+            const startY = Math.floor((cameraY - canvas.height / 2) / gridSize) * gridSize;
+            const endX = Math.ceil((cameraX + canvas.width / 2) / gridSize) * gridSize;
+            const endY = Math.ceil((cameraY + canvas.height / 2) / gridSize) * gridSize;
+
+            for (let x = startX; x < endX; x += gridSize) {
+                if (x >= 0 && x <= settings.MAP_SIZE) { // Рисуем только внутри карты
+                    ctx.beginPath();
+                    ctx.moveTo(x, Math.max(0, startY)); // Ограничиваем начало линии картой
+                    ctx.lineTo(x, Math.min(settings.MAP_SIZE, endY)); // Ограничиваем конец линии картой
+                    ctx.stroke();
+                 }
+            }
+            for (let y = startY; y < endY; y += gridSize) {
+                 if (y >= 0 && y <= settings.MAP_SIZE) { // Рисуем только внутри карты
+                    ctx.beginPath();
+                    ctx.moveTo(Math.max(0, startX), y); // Ограничиваем начало линии картой
+                    ctx.lineTo(Math.min(settings.MAP_SIZE, endX), y); // Ограничиваем конец линии картой
+                    ctx.stroke();
+                 }
+            }
+         }
+
+         function darkenColor(hex, factor) {
+             let r = parseInt(hex.slice(1, 3), 16);
+             let g = parseInt(hex.slice(3, 5), 16);
+             let b = parseInt(hex.slice(5, 7), 16);
+             r = Math.floor(r * factor);
+             g = Math.floor(g * factor);
+             b = Math.floor(b * factor);
+             return `#${r.toString(16).padStart(2, '0')}${g.toString(16).padStart(2, '0')}${b.toString(16).padStart(2, '0')}`;
+         }
+
+        // --- Update UI Elements ---
+         function updateHUD() {
+             if (players[playerId]) {
+                 hudHealth.textContent = players[playerId].health;
+             }
+         }
+
+         function checkPlayerDeathStatus() {
+             if (players[playerId] && players[playerId].dead && deathMessage.style.display !== 'block') {
+                 deathMessage.style.display = 'block';
+             } else if (players[playerId] && !players[playerId].dead && deathMessage.style.display === 'block') {
+                 deathMessage.style.display = 'none';
+             } else if (!players[playerId] && deathMessage.style.display === 'block') {
+                 // Если игрок был удален (например, дисконнект)
+                  deathMessage.style.display = 'none';
+             }
+         }
+
+         function updateLeaderboard() {
+              // 1. Преобразуем объект players в массив
+              const playerList = Object.values(players).filter(p => !p.dead); // Показываем только живых
+
+              // 2. Сортируем по очкам (от большего к меньшему)
+              playerList.sort((a, b) => b.score - a.score);
+
+              // 3. Очищаем текущий список
+              leaderboardList.innerHTML = '';
+
+              // 4. Добавляем топ-N игроков (например, топ-10)
+              const topN = Math.min(playerList.length, 10);
+              for (let i = 0; i < topN; i++) {
+                  const player = playerList[i];
+                  const listItem = document.createElement('li');
+                  listItem.textContent = `${player.name}: ${player.score}`;
+                  if (player.id === playerId) {
+                      listItem.style.fontWeight = 'bold'; // Выделяем текущего игрока
+                  }
+                  leaderboardList.appendChild(listItem);
+              }
+         }
+
+    </script>
+</body>
+</html>
