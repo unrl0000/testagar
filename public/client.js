@@ -190,8 +190,13 @@ function connectWebSocket(name, race) {
                           // Or ensure gameLoop handles 'isDead' -> !'isDead' transition gracefully.
                       }
                      break;
-                // Handle other message types (playerJoined, playerLeft, meleeVisual, etc.)
-            }
+                case 'meleeVisual':
+                    showMeleeAttackVisual(message.angle, message.reach);
+                    break;
+                case 'hitConfirm':
+                    showHitConfirmation(message.targetId, message.damage);
+                    break;
+                }
         } catch (error) {
             console.error('Error processing message:', event.data, error);
         }
@@ -215,6 +220,47 @@ function connectWebSocket(name, race) {
         gameState = { players: [], orbs: [], projectiles: [] };
         selfId = null;
     };
+}
+
+function showMeleeAttackVisual(angle, reach) {
+    // Добавить временный визуальный эффект атаки в указанном направлении
+    const selfPlayer = gameState.players.find(p => p.id === selfId);
+    if (!selfPlayer) return;
+    
+    // Создаем временный эффект атаки
+    const attackVisuals = {
+        x: selfPlayer.x,
+        y: selfPlayer.y,
+        angle: angle,
+        reach: reach,
+        created: Date.now(),
+        duration: 200 // мс
+    };
+    
+    // Добавляем в массив визуальных эффектов для отрисовки
+    gameVisualEffects.push(attackVisuals);
+}
+
+// В функции gameLoop добавьте отрисовку эффектов
+function drawVisualEffects() {
+    // Фильтруем истекшие эффекты
+    gameVisualEffects = gameVisualEffects.filter(effect => 
+        Date.now() - effect.created < effect.duration
+    );
+    
+    // Отрисовываем активные эффекты
+    gameVisualEffects.forEach(effect => {
+        if (effect.type === 'meleeAttack') {
+            // Рисуем дугу/конус атаки
+            ctx.fillStyle = 'rgba(255, 255, 255, 0.3)';
+            ctx.beginPath();
+            ctx.moveTo(effect.x, effect.y);
+            ctx.arc(effect.x, effect.y, effect.reach, 
+                   effect.angle - Math.PI/4, effect.angle + Math.PI/4);
+            ctx.closePath();
+            ctx.fill();
+        }
+    });
 }
 
 // --- Input Handling (Mouse/Keyboard) ---
