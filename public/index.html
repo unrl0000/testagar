@@ -12,11 +12,11 @@
         <input type="text" id="name-input" placeholder="Enter your name" maxlength="16">
         <div id="race-selection">
             <p>Choose your Race:</p>
-            <button data-race="human">Human</button>
-            <button data-race="elf">Elf</button>
-            <button data-race="gnome">Gnome</button>
-            <button data-race="vampire">Vampire</button>
-            <button data-race="goblin">Goblin</button>
+            <button data-race="human" class="race-btn">Human</button>
+            <button data-race="elf" class="race-btn">Elf</button>
+            <button data-race="gnome" class="race-btn">Gnome</button>
+            <button data-race="vampire" class="race-btn">Vampire</button>
+            <button data-race="goblin" class="race-btn">Goblin</button>
         </div>
         <button id="start-button">Join Game</button>
         <p id="error-message" class="error"></p>
@@ -40,6 +40,13 @@
             <button id="attack-button">Attack</button>
         </div>
     </div>
+
+    <!-- UI Overlay elements -->
+     <div id="ui-overlay">
+         <!-- Leaderboard will be drawn on canvas for simplicity, but this div could hold it -->
+         <!-- <div id="leaderboard"></div> -->
+     </div>
+
 
     <script src="client.js"></script>
 </body>
