@@ -1,243 +1,335 @@
-const express = require('express');
+// server.js
+const WebSocket = require('ws');
 const http = require('http');
-const { Server } = require("socket.io");
-const path = require('path');
 
-// --- Настройки ---
-const MAP_WIDTH = 2000;
-const MAP_HEIGHT = 2000;
-const INITIAL_PLAYER_SIZE = 20;
-const FOOD_COUNT = 150;
-const FOOD_SIZE = 8;
-const PLAYER_SPEED_FACTOR = 8; // Чем меньше, тем быстрее
-const EAT_RATIO = 1.1; // Нужно быть больше в X раз, чтобы съесть
-const SERVER_TICK_RATE = 30; // Обновлений в секунду
+// --- Settings ---
+const PORT = process.env.PORT || 3000; // Важно для Render.com
+const TICK_RATE = 30; // Updates per second
+const MAP_SIZE = 2000;
+const PLAYER_RADIUS = 20;
+const PLAYER_SPEED = 250 / TICK_RATE; // Pixels per tick
+const BULLET_RADIUS = 8;
+const BULLET_SPEED = 500 / TICK_RATE; // Pixels per tick
+const BULLET_LIFESPAN = 1.5 * TICK_RATE; // Ticks
+const PLAYER_MAX_HEALTH = 100;
+const BULLET_DAMAGE = 10;
+const RESPAWN_TIME = 3 * 1000; // milliseconds
 
-// --- Приложение Express и сервер HTTP ---
-const app = express();
-const server = http.createServer(app);
-// --- Socket.IO ---
-// Настроим CORS для локальной разработки (на Render может не понадобиться, но не повредит)
-const io = new Server(server, {
-    cors: {
-        origin: "*", // Разрешить все источники (для простоты)
-        methods: ["GET", "POST"]
-    }
-});
+// --- Game State ---
+const players = {}; // { id: { x, y, angle, health, color, name, lastInputTime, dead, respawnTimer } }
+const bullets = {}; // { id: { x, y, angle, ownerId, life } }
+let nextBulletId = 0;
 
-// --- Обслуживание статических файлов ---
-// Отдаем файлы из папки 'public' (index.html, game.js, style.css)
-app.use(express.static(path.join(__dirname, 'public')));
+// --- Helper Functions ---
+function generateId() {
+    return Math.random().toString(36).substring(2, 15);
+}
 
-// --- Маршрут для главной страницы ---
-// Express сам найдет index.html в папке public, но можно и явно указать
-app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// --- Игровое состояние ---
-let players = {}; // { socket.id: { id: socket.id, name: name, x: x, y: y, size: size, color: color, targetX: x, targetY: y } }
-let food = [];
-
-// --- Вспомогательные функции ---
 function getRandomColor() {
-    return `hsl(${Math.floor(Math.random() * 360)}, 70%, 50%)`;
-}
-
-function generateFood() {
-    const needed = FOOD_COUNT - food.length;
-    for (let i = 0; i < needed; i++) {
-        food.push({
-            id: Math.random().toString(36).substring(7), // Простой ID для еды
-            x: Math.random() * (MAP_WIDTH - FOOD_SIZE * 2) + FOOD_SIZE,
-            y: Math.random() * (MAP_HEIGHT - FOOD_SIZE * 2) + FOOD_SIZE,
-            size: FOOD_SIZE,
-            color: getRandomColor()
-        });
+    const letters = '0123456789ABCDEF';
+    let color = '#';
+    for (let i = 0; i < 6; i++) {
+        color += letters[Math.floor(Math.random() * 16)];
     }
+    return color;
 }
 
-function getPlayerById(playerId) {
-    return players[playerId];
+function clamp(value, min, max) {
+    return Math.max(min, Math.min(max, value));
 }
 
-function getDistance(obj1, obj2) {
-    const dx = obj1.x - obj2.x;
-    const dy = obj1.y - obj2.y;
-    return Math.sqrt(dx * dx + dy * dy);
-    // или return Math.hypot(dx, dy); // Более точный и читаемый способ
+function distance(x1, y1, x2, y2) {
+    return Math.sqrt((x1 - x2) ** 2 + (y1 - y2) ** 2);
 }
 
-// --- Инициализация игры ---
-generateFood();
+// --- Server Setup ---
+const server = http.createServer((req, res) => {
+    // Простая заглушка для HTTP запросов, если нужно будет отдавать HTML не через WS
+    res.writeHead(404);
+    res.end();
+});
 
-// --- Обработка подключений Socket.IO ---
-io.on('connection', (socket) => {
-    console.log(`Client connected: ${socket.id}`);
+const wss = new WebSocket.Server({ server });
 
-    // Игрок входит в игру
-    socket.on('join', (data) => {
-        const name = (data.name || 'Blob').substring(0, 15); // Ограничим ник
-        console.log(`Player ${name} (${socket.id}) joining.`);
+console.log(`WebSocket server started on port ${PORT}`);
 
-        // Создаем нового игрока
-        const player = {
-            id: socket.id,
-            name: name,
-            x: Math.random() * (MAP_WIDTH - INITIAL_PLAYER_SIZE * 2) + INITIAL_PLAYER_SIZE,
-            y: Math.random() * (MAP_HEIGHT - INITIAL_PLAYER_SIZE * 2) + INITIAL_PLAYER_SIZE,
-            size: INITIAL_PLAYER_SIZE,
-            color: getRandomColor(),
-            targetX: 0, // Вектор направления от мыши
-            targetY: 0
-        };
-        players[socket.id] = player;
+wss.on('connection', (ws) => {
+    const playerId = generateId();
+    const player = {
+        id: playerId,
+        x: Math.random() * (MAP_SIZE - 100) + 50,
+        y: Math.random() * (MAP_SIZE - 100) + 50,
+        angle: 0,
+        health: PLAYER_MAX_HEALTH,
+        color: getRandomColor(),
+        name: "Player " + Math.floor(Math.random() * 1000),
+        inputs: { left: false, right: false, up: false, down: false },
+        mouse: { x: 0, y: 0, down: false },
+        lastUpdateTime: Date.now(),
+        dead: false,
+        respawnTimer: null,
+        score: 0, // Добавим счет
+    };
+    players[playerId] = player;
+    ws.playerId = playerId; // Связываем ID с WebSocket соединением
 
-        // 1. Отправляем новому игроку его ID и размер карты
-        socket.emit('game_setup', { playerId: socket.id, mapWidth: MAP_WIDTH, mapHeight: MAP_HEIGHT });
+    console.log(`Player ${playerId} (${player.name}) connected.`);
 
-        // 2. Отправляем новому игроку текущее состояние ВСЕХ игроков и еды
-        socket.emit('current_state', { players: Object.values(players), food: food });
+    // Отправляем новому игроку его ID и текущее состояние игры
+    ws.send(JSON.stringify({
+        type: 'init',
+        payload: {
+            playerId: playerId,
+            players: players,
+            bullets: bullets,
+            settings: { MAP_SIZE, PLAYER_RADIUS, BULLET_RADIUS, PLAYER_MAX_HEALTH }
+        }
+    }));
 
-        // 3. Оповещаем ВСЕХ ОСТАЛЬНЫХ о новом игроке
-        socket.broadcast.emit('player_joined', player); // broadcast = всем, кроме отправителя
-    });
+    // Оповещаем всех остальных о новом игроке
+    broadcast({
+        type: 'playerJoined',
+        payload: { player: players[playerId] }
+    }, ws); // Отправляем всем, кроме нового игрока
 
-    // Получаем направление движения от клиента
-    socket.on('player_move', (data) => {
-        const player = getPlayerById(socket.id);
-        if (player) {
-            // data.x, data.y - координаты мыши относительно центра ЭКРАНА КЛИЕНТА
-            player.targetX = data.x || 0;
-            player.targetY = data.y || 0;
+    ws.on('message', (message) => {
+        try {
+            const data = JSON.parse(message);
+            const player = players[ws.playerId];
+            if (!player || player.dead) return; // Игнорировать ввод от мертвого или несуществующего игрока
+
+            player.lastUpdateTime = Date.now(); // Обновляем время активности
+
+            switch (data.type) {
+                case 'input':
+                    player.inputs = data.payload.keys;
+                    player.mouse = data.payload.mouse;
+                    // Обновляем угол игрока на сервере
+                    player.angle = Math.atan2(player.mouse.y - player.y, player.mouse.x - player.x);
+                    break;
+                case 'shoot':
+                    if (!player.dead) {
+                        spawnBullet(player);
+                    }
+                    break;
+                case 'setName':
+                    if (data.payload && typeof data.payload.name === 'string') {
+                        player.name = data.payload.name.substring(0, 16); // Ограничиваем длину имени
+                        broadcast({ type: 'nameUpdate', payload: { id: playerId, name: player.name } });
+                    }
+                    break;
+                case 'ping': // Для замера задержки (не обязательно)
+                    ws.send(JSON.stringify({ type: 'pong' }));
+                    break;
+            }
+        } catch (error) {
+            console.error('Failed to process message:', message, error);
         }
     });
 
-    // Клиент отключился
-    socket.on('disconnect', () => {
-        console.log(`Client disconnected: ${socket.id}`);
-        const player = players[socket.id];
-        if (player) {
-            delete players[socket.id]; // Удаляем игрока из объекта
-            // Оповещаем всех остальных, что игрок ушел
-            io.emit('player_left', { id: socket.id }); // io.emit = всем подключенным
+    ws.on('close', () => {
+        console.log(`Player ${ws.playerId} disconnected.`);
+        const disconnectedPlayer = players[ws.playerId];
+        delete players[ws.playerId];
+        // Оповещаем всех остальных об отключении
+        broadcast({
+            type: 'playerLeft',
+            payload: { id: ws.playerId, name: disconnectedPlayer ? disconnectedPlayer.name : 'Unknown' }
+        });
+    });
+
+    ws.on('error', (error) => {
+        console.error(`WebSocket error for player ${ws.playerId}:`, error);
+        // Можно также обработать отключение здесь
+        if (players[ws.playerId]) {
+             const disconnectedPlayer = players[ws.playerId];
+             delete players[ws.playerId];
+             broadcast({ type: 'playerLeft', payload: { id: ws.playerId, name: disconnectedPlayer ? disconnectedPlayer.name : 'Unknown' } });
         }
     });
 });
 
-// --- Игровой цикл ---
-function gameLoop() {
-    let foodEatenIndices = new Set();
-    let playersToRemove = new Set();
-    let playerUpdates = []; // Для оптимизации можно собирать только изменения
+function spawnBullet(player) {
+    const bulletId = `b${nextBulletId++}`;
+    const bullet = {
+        id: bulletId,
+        ownerId: player.id,
+        x: player.x + Math.cos(player.angle) * (PLAYER_RADIUS + BULLET_RADIUS + 1),
+        y: player.y + Math.sin(player.angle) * (PLAYER_RADIUS + BULLET_RADIUS + 1),
+        angle: player.angle,
+        life: BULLET_LIFESPAN
+    };
+    bullets[bulletId] = bullet;
+}
 
-    // 1. Движение и границы карты
-    Object.values(players).forEach(player => {
-        const targetX = player.targetX;
-        const targetY = player.targetY;
-        const distanceToTarget = Math.hypot(targetX, targetY);
+function updatePlayerPosition(player, dt) {
+    let dx = 0;
+    let dy = 0;
+    if (player.inputs.left) dx -= 1;
+    if (player.inputs.right) dx += 1;
+    if (player.inputs.up) dy -= 1;
+    if (player.inputs.down) dy += 1;
 
-        let directionX = 0;
-        let directionY = 0;
-        if (distanceToTarget > 1) { // Двигаемся, только если курсор не в центре
-            directionX = targetX / distanceToTarget;
-            directionY = targetY / distanceToTarget;
-        }
+    // Нормализация диагонального движения
+    const magnitude = Math.sqrt(dx * dx + dy * dy);
+    if (magnitude > 0) {
+        dx = (dx / magnitude);
+        dy = (dy / magnitude);
+    }
 
-        // Скорость зависит от размера
-        const speed = PLAYER_SPEED_FACTOR / (1 + Math.log1p(player.size / INITIAL_PLAYER_SIZE));
+    player.x += dx * PLAYER_SPEED;
+    player.y += dy * PLAYER_SPEED;
 
-        const newX = player.x + directionX * speed;
-        const newY = player.y + directionY * speed;
+    // Ограничение по карте
+    player.x = clamp(player.x, PLAYER_RADIUS, MAP_SIZE - PLAYER_RADIUS);
+    player.y = clamp(player.y, PLAYER_RADIUS, MAP_SIZE - PLAYER_RADIUS);
+}
 
-        // Ограничение по карте (учитываем радиус)
-        const radius = player.size / 2;
-        player.x = Math.max(radius, Math.min(MAP_WIDTH - radius, newX));
-        player.y = Math.max(radius, Math.min(MAP_HEIGHT - radius, newY));
-    });
+function updateBulletPosition(bullet, dt) {
+    bullet.x += Math.cos(bullet.angle) * BULLET_SPEED;
+    bullet.y += Math.sin(bullet.angle) * BULLET_SPEED;
+    bullet.life -= 1;
+}
 
-    const playerList = Object.values(players); // Для итераций
-
-    // 2. Поедание еды
-    playerList.forEach(player => {
-        if (playersToRemove.has(player.id)) return; // Пропускаем уже съеденных
-
-        const playerRadius = player.size / 2;
-        food.forEach((f, index) => {
-            if (foodEatenIndices.has(index)) return;
-
-            const dist = getDistance(player, f);
-            if (dist < playerRadius - f.size / 3) { // Касание для поедания
-                player.size += f.size * 0.2;
-                foodEatenIndices.add(index);
-            }
-        });
-    });
-
-    // 3. Поедание игроков
+function checkCollisions() {
+    const bulletIds = Object.keys(bullets);
     const playerIds = Object.keys(players);
-    for (let i = 0; i < playerIds.length; i++) {
-        const idA = playerIds[i];
-        if (playersToRemove.has(idA)) continue;
-        const playerA = players[idA];
 
-        for (let j = i + 1; j < playerIds.length; j++) {
-            const idB = playerIds[j];
-            if (playersToRemove.has(idB)) continue;
-            const playerB = players[idB];
+    for (const bulletId of bulletIds) {
+        const bullet = bullets[bulletId];
+        if (!bullet) continue;
 
-            const dist = getDistance(playerA, playerB);
-            const radiusA = playerA.size / 2;
-            const radiusB = playerB.size / 2;
+        // Столкновение пули со стенами
+        if (bullet.x < 0 || bullet.x > MAP_SIZE || bullet.y < 0 || bullet.y > MAP_SIZE || bullet.life <= 0) {
+            delete bullets[bulletId];
+            continue;
+        }
 
-            if (dist < radiusA - radiusB * 0.8 && playerA.size > playerB.size * EAT_RATIO) {
-                // A ест B
-                playerA.size += playerB.size;
-                playersToRemove.add(idB);
-                console.log(`${playerA.name} ate ${playerB.name}`);
-            } else if (dist < radiusB - radiusA * 0.8 && playerB.size > playerA.size * EAT_RATIO) {
-                // B ест A
-                playerB.size += playerA.size;
-                playersToRemove.add(idA);
-                console.log(`${playerB.name} ate ${playerA.name}`);
-                break; // A съели, нет смысла проверять его дальше
+        // Столкновение пули с игроками
+        for (const playerId of playerIds) {
+            const player = players[playerId];
+            if (!player || player.dead || player.id === bullet.ownerId) continue; // Не сталкиваться с собой или мертвыми
+
+            const dist = distance(bullet.x, bullet.y, player.x, player.y);
+            if (dist < PLAYER_RADIUS + BULLET_RADIUS) {
+                player.health -= BULLET_DAMAGE;
+                delete bullets[bulletId]; // Пуля исчезает
+
+                if (player.health <= 0) {
+                    console.log(`Player ${player.id} (${player.name}) killed by ${bullet.ownerId}`);
+                    player.dead = true;
+                    player.health = 0;
+                    // Добавляем очки убийце
+                    if (players[bullet.ownerId]) {
+                        players[bullet.ownerId].score += 1; // Увеличиваем счет убийцы
+                    }
+                    // Запускаем таймер респавна
+                    player.respawnTimer = setTimeout(() => {
+                        respawnPlayer(player);
+                    }, RESPAWN_TIME);
+
+                    // Оповещаем всех о смерти и обновлении счета
+                    broadcast({ type: 'playerDied', payload: { victimId: player.id, killerId: bullet.ownerId, killerScore: players[bullet.ownerId]?.score ?? 0 } });
+                } else {
+                     // Оповещаем об изменении здоровья
+                     broadcast({ type: 'healthUpdate', payload: { id: player.id, health: player.health }});
+                }
+                break; // Пуля может поразить только одного игрока
             }
         }
     }
+}
 
-    // 4. Удаление съеденных игроков
-    if (playersToRemove.size > 0) {
-        playersToRemove.forEach(sid => {
-            const eatenPlayer = players[sid]; // Получаем данные перед удалением
-            if (eatenPlayer) {
-                 delete players[sid];
-                 io.emit('player_eaten', { eaten_id: sid }); // Оповещаем всех
-                 // Отправляем сообщение 'game_over' конкретному съеденному игроку
-                 io.to(sid).emit('game_over', { message: `You were eaten!` });
-            }
-        });
+function respawnPlayer(player) {
+    if (!players[player.id]) return; // Игрок мог отключиться
+
+    player.x = Math.random() * (MAP_SIZE - 100) + 50;
+    player.y = Math.random() * (MAP_SIZE - 100) + 50;
+    player.health = PLAYER_MAX_HEALTH;
+    player.dead = false;
+    player.respawnTimer = null;
+    console.log(`Player ${player.id} respawned.`);
+
+    // Оповещаем всех о респавне
+    broadcast({ type: 'playerRespawned', payload: { player: player } });
+}
+
+// --- Game Loop ---
+function gameLoop() {
+    const now = Date.now();
+    const dt = (now - (lastUpdateTime || now)) / 1000; // Delta time in seconds (не используется пока, но полезно)
+    lastUpdateTime = now;
+
+    // Update players
+    for (const playerId in players) {
+        const player = players[playerId];
+        if (player.dead) continue;
+        updatePlayerPosition(player, dt);
+         // Обновляем угол игрока (можно делать и здесь, если не обновлять по каждому движению мыши)
+        // player.angle = Math.atan2(player.mouse.y - player.y, player.mouse.x - player.x);
     }
 
-
-    // 5. Удаление съеденной еды и генерация новой
-    if (foodEatenIndices.size > 0) {
-        // Фильтруем еду - создаем новый массив без съеденных элементов
-        food = food.filter((_, index) => !foodEatenIndices.has(index));
-        generateFood(); // Добавляем новую еду
+    // Update bullets
+    for (const bulletId in bullets) {
+        updateBulletPosition(bullets[bulletId], dt);
     }
 
-    // 6. Отправка обновленного состояния всем клиентам
-    io.emit('game_update', {
-        players: Object.values(players), // Отправляем актуальный список игроков
-        food: food // Отправляем всю еду (проще для начала)
+    // Check collisions
+    checkCollisions();
+
+    // Prepare state for broadcast
+    const gameState = {
+        players: {},
+        bullets: bullets // Можно отправлять все пули или только изменения
+    };
+    // Отправляем только нужные данные об игроках
+    for (const pId in players) {
+        const p = players[pId];
+        gameState.players[pId] = {
+            x: p.x,
+            y: p.y,
+            angle: p.angle,
+            color: p.color,
+            name: p.name,
+            health: p.health,
+            dead: p.dead,
+            score: p.score // Добавляем счет
+        };
+    }
+
+    // Broadcast game state to all clients
+    broadcast({ type: 'update', payload: gameState });
+
+    // Проверка неактивных игроков (опционально)
+    const kickTimeout = 60000; // 1 минута неактивности
+     for (const playerId in players) {
+         if (now - players[playerId].lastUpdateTime > kickTimeout) {
+            const wsToKick = Array.from(wss.clients).find(client => client.playerId === playerId);
+             if (wsToKick) {
+                 console.log(`Kicking inactive player ${playerId}`);
+                 wsToKick.close(1000, "Kicked due to inactivity"); // Закрываем соединение
+             }
+             // Удаление произойдет в ws.on('close')
+         }
+     }
+
+}
+
+let lastUpdateTime = Date.now();
+setInterval(gameLoop, 1000 / TICK_RATE);
+
+// --- Broadcast Function ---
+function broadcast(message, senderWs = null) {
+    const messageString = JSON.stringify(message);
+    wss.clients.forEach((client) => {
+        // Отправляем всем, кроме senderWs, если он указан
+        if (client !== senderWs && client.readyState === WebSocket.OPEN) {
+            client.send(messageString);
+        }
     });
 }
 
-// Запускаем игровой цикл с заданной частотой
-setInterval(gameLoop, 1000 / SERVER_TICK_RATE);
-
-// --- Запуск сервера ---
-const PORT = process.env.PORT || 3000; // Render предоставит process.env.PORT
+// --- Start Server ---
 server.listen(PORT, () => {
-    console.log(`Server listening on port ${PORT}`);
+    console.log(`HTTP server listening on port ${PORT} (for WebSocket upgrades)`);
 });
