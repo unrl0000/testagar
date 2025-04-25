@@ -1,0 +1,195 @@
+/* style.css */
+body {
+    margin: 0;
+    padding: 0;
+    overflow: hidden;
+    font-family: sans-serif;
+    background-color: #333;
+    color: #eee;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    height: 100vh;
+}
+
+#game-canvas {
+    display: none; /* Hidden until game starts */
+    background-color: #222; /* Dark background for the game */
+    /* Dimensions will be set by JS */
+}
+
+#start-screen {
+    text-align: center;
+    background-color: #444;
+    padding: 30px;
+    border-radius: 10px;
+    box-shadow: 0 0 15px rgba(0, 0, 0, 0.5);
+}
+
+#start-screen h1 {
+    margin-top: 0;
+    color: #f0e370; /* Orb color */
+}
+
+#name-input {
+    padding: 10px;
+    margin-bottom: 15px;
+    width: 80%;
+    max-width: 250px;
+    border: 1px solid #666;
+    background-color: #555;
+    color: #eee;
+    border-radius: 5px;
+}
+
+#race-selection p {
+    margin-bottom: 10px;
+}
+
+#race-selection button,
+#start-button {
+    padding: 10px 15px;
+    margin: 5px;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    background-color: #666;
+    color: #eee;
+    font-size: 1em;
+    transition: background-color 0.2s ease;
+}
+
+#race-selection button:hover,
+#start-button:hover {
+    background-color: #777;
+}
+
+#race-selection button.selected {
+    background-color: #f0e370;
+    color: #333;
+    font-weight: bold;
+}
+
+#start-button {
+    margin-top: 20px;
+    background-color: #5cb85c; /* Green */
+}
+#start-button:hover {
+    background-color: #4cae4c;
+}
+
+
+.error {
+    color: #d9534f; /* Red for errors */
+    margin-top: 10px;
+    min-height: 1em;
+}
+
+
+#level2-selection {
+    position: fixed;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    background-color: rgba(0, 0, 0, 0.85);
+    padding: 25px;
+    border-radius: 8px;
+    text-align: center;
+    z-index: 100;
+    color: #eee;
+    box-shadow: 0 0 20px rgba(0, 0, 0, 0.7);
+}
+
+#level2-selection h2 {
+    margin-top: 0;
+    color: #f0e370;
+}
+
+#level2-options button {
+    display: block;
+    width: 100%;
+    padding: 12px 20px;
+    margin: 10px 0;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    background-color: #555;
+    color: #eee;
+    font-size: 1.1em;
+    transition: background-color 0.2s ease;
+}
+
+#level2-options button:hover {
+    background-color: #6a706b; /* Goblin color */
+}
+
+/* --- Touch Controls Styling --- */
+#touch-controls {
+    position: fixed;
+    bottom: 0;
+    left: 0;
+    width: 100%;
+    height: 150px; /* Adjust height as needed */
+    pointer-events: none; /* Allow clicks/taps to pass through the container */
+    display: none; /* Hidden by default, shown via JS for touch devices */
+}
+
+#joystick-area {
+    position: absolute;
+    bottom: 20px;
+    left: 20px;
+    width: 120px;
+    height: 120px;
+    background-color: rgba(100, 100, 100, 0.3);
+    border-radius: 50%;
+    pointer-events: auto; /* Enable touch events for this area */
+}
+
+#joystick-thumb {
+    position: absolute;
+    width: 60px;
+    height: 60px;
+    background-color: rgba(200, 200, 200, 0.5);
+    border-radius: 50%;
+    top: 30px; /* Center initially */
+    left: 30px; /* Center initially */
+    pointer-events: none; /* Thumb doesn't capture events itself */
+}
+
+#attack-button-area {
+    position: absolute;
+    bottom: 30px;
+    right: 30px;
+    pointer-events: auto; /* Enable touch events for this area */
+}
+
+#attack-button {
+    width: 80px;
+    height: 80px;
+    background-color: rgba(217, 37, 37, 0.5); /* Vampire color, semi-transparent */
+    border-radius: 50%;
+    border: none;
+    color: white;
+    font-size: 1em;
+    font-weight: bold;
+     display: flex;
+     justify-content: center;
+     align-items: center;
+     text-align: center;
+     line-height: 1.2;
+}
+
+/* Add simple player UI elements (drawn on canvas, but CSS might style overlays later) */
+/* Example: Leaderboard placeholder */
+#leaderboard {
+    position: fixed;
+    top: 10px;
+    right: 10px;
+    background-color: rgba(0, 0, 0, 0.5);
+    padding: 10px;
+    border-radius: 5px;
+    color: #eee;
+    min-width: 150px;
+    max-height: 300px;
+    overflow-y: auto;
+}
