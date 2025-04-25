@@ -3,439 +3,404 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>dipper.io</title>
+    <title>Dipper.io</title>
     <style>
-        body { margin: 0; overflow: hidden; background-color: #333; color: white; font-family: sans-serif; }
-        canvas { display: block; background-color: #ddd; }
-        #info { position: absolute; top: 10px; left: 10px; background: rgba(0,0,0,0.5); padding: 5px; border-radius: 5px; }
-        #leaderboard { position: absolute; top: 10px; right: 10px; background: rgba(0,0,0,0.5); padding: 10px; border-radius: 5px; min-width: 150px; }
-        #leaderboard h3 { margin: 0 0 5px 0; text-align: center; }
-        #leaderboard ol { margin: 0; padding: 0 0 0 20px; }
+        body { margin: 0; overflow: hidden; background-color: #f0f0f0; font-family: sans-serif; }
+        canvas { display: block; background-color: #e0e0e0; }
         #disconnect-message {
-            position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%);
-            background: rgba(200, 0, 0, 0.8); color: white; padding: 20px;
-            border-radius: 10px; font-size: 1.5em; text-align: center; display: none; /* Скрыто по умолчанию */
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background-color: rgba(0,0,0,0.7);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            font-size: 1.5em;
+            display: none; /* Hidden by default */
+            text-align: center;
         }
+         #scoreboard {
+            position: absolute;
+            top: 10px;
+            right: 10px;
+            background-color: rgba(0,0,0,0.5);
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            min-width: 150px;
+         }
+         #scoreboard h3 { margin: 0 0 5px 0; }
+         #scoreboard ul { list-style: none; padding: 0; margin: 0; }
+         #scoreboard li { margin-bottom: 3px; }
+
     </style>
 </head>
 <body>
     <canvas id="gameCanvas"></canvas>
-    <div id="info">
-        HP: <span id="hp">N/A</span> / <span id="maxHp">N/A</span><br>
-        Kills: <span id="kills">N/A</span>
+    <div id="disconnect-message">
+        Disconnected from server.<br>Please refresh the page.
     </div>
-     <div id="leaderboard">
-        <h3>Leaderboard</h3>
-        <ol id="leaderboard-list"></ol>
-    </div>
-     <div id="disconnect-message">
-        Disconnected from server. Please refresh the page.
+     <div id="scoreboard">
+        <h3>Scoreboard</h3>
+        <ul id="score-list"></ul>
     </div>
 
     <script>
         const canvas = document.getElementById('gameCanvas');
         const ctx = canvas.getContext('2d');
-        const hpElement = document.getElementById('hp');
-        const maxHpElement = document.getElementById('maxHp');
-        const killsElement = document.getElementById('kills');
-        const leaderboardList = document.getElementById('leaderboard-list');
         const disconnectMessage = document.getElementById('disconnect-message');
+        const scoreList = document.getElementById('score-list');
 
-        // --- Глобальные переменные клиента ---
-        let socket = null;
-        let localPlayerId = null;
-        let clientGameState = { players: {}, bullets: [] }; // Локальная копия состояния
+
+        // --- Constants (match server if needed, or client-specific) ---
+        const PLAYER_RADIUS = 20;
+        const BULLET_RADIUS = 8;
+        const TURRET_LENGTH = PLAYER_RADIUS * 1.4;
+        const TURRET_WIDTH = 10;
+        const HEALTH_BAR_WIDTH = 40;
+        const HEALTH_BAR_HEIGHT = 5;
+        const MAP_WIDTH = 2000; // Should match server
+        const MAP_HEIGHT = 2000; // Should match server
+
+
+        // --- Game State (Client Side) ---
+        let players = {}; // { id: { x, y, angle, health, maxHealth, score, color, dead } }
+        let bullets = {}; // { id: { x, y } }
+        let myPlayerId = null;
+        let ws = null;
+        let connected = false;
         let cameraX = 0;
         let cameraY = 0;
-        const localInputState = {
-            keys: { w: false, a: false, s: false, d: false },
-            angle: 0,
-            shooting: false
-        };
-        let lastSentInputState = {}; // Для отправки только изменений
 
-        const MAP_SIZE = 2000; // Должно совпадать с серверным
-        const PLAYER_RADIUS = 20; // Должно совпадать с серверным
-        const BULLET_RADIUS = 8;  // Должно совпадать с серверным
+        // --- Input State ---
+        const keys = { w: false, a: false, s: false, d: false };
+        let mouseX = 0;
+        let mouseY = 0;
+        let isShooting = false;
+        let lastSentAngle = 0;
+        let lastSentInput = {};
 
-        // --- Подключение к WebSocket ---
-        function connectWebSocket() {
-            // Определяем протокол (ws или wss) и хост
-            const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-            const host = window.location.host; // Используем тот же хост, где загружена страница
-            const socketURL = `${protocol}//${host}`;
-
-            console.log(`Connecting to WebSocket at ${socketURL}`);
-            socket = new WebSocket(socketURL);
-
-            socket.onopen = () => {
-                console.log('WebSocket connection established.');
-                disconnectMessage.style.display = 'none'; // Скрыть сообщение об отключении
-                requestAnimationFrame(gameLoop); // Начинаем рендеринг
-            };
-
-            socket.onmessage = (event) => {
-                try {
-                    const message = JSON.parse(event.data);
-                    handleServerMessage(message);
-                } catch (error) {
-                    console.error('Failed to parse server message:', event.data, error);
-                }
-            };
-
-            socket.onclose = (event) => {
-                console.log('WebSocket connection closed.', event.reason);
-                disconnectMessage.style.display = 'block'; // Показать сообщение об отключении
-                // Можно попытаться переподключиться через некоторое время
-                 socket = null; // Сбросить сокет
-                 // setTimeout(connectWebSocket, 5000); // Попробовать переподключиться через 5 секунд
-            };
-
-            socket.onerror = (error) => {
-                console.error('WebSocket error:', error);
-                disconnectMessage.style.display = 'block'; // Показать сообщение об ошибке
-                socket = null; // Сбросить сокет
-            };
-        }
-
-        // --- Обработка сообщений от сервера ---
-        function handleServerMessage(message) {
-            switch (message.type) {
-                case 'init':
-                    localPlayerId = message.payload.id;
-                    clientGameState = message.payload.initialState;
-                    console.log(`Initialized with Player ID: ${localPlayerId}`);
-                    updateUI(); // Обновить UI при инициализации
-                    break;
-                case 'update':
-                    // Просто заменяем всё состояние (неэффективно, но просто)
-                    clientGameState = message.payload;
-                    updateLeaderboard(); // Обновить лидерборд при каждом апдейте
-                    updateUI(); // Обновить HP/Kills
-                    break;
-                case 'player_left':
-                    // Удаляем игрока из локального состояния (сервер уже сделал это)
-                     if (clientGameState.players[message.payload.id]) {
-                        delete clientGameState.players[message.payload.id];
-                    }
-                     console.log(`Player ${message.payload.id} left.`);
-                     updateLeaderboard();
-                    break;
-                case 'player_died':
-                    // Можно добавить визуальный эффект или сообщение о смерти
-                    if (message.payload.victimId === localPlayerId) {
-                        console.log("You were killed!");
-                        // Можно показать сообщение "You died!" на экране
-                    } else {
-                        console.log(`Player ${message.payload.victimId} killed by ${message.payload.killerId}`);
-                    }
-                    break;
-                 case 'player_respawn':
-                     // Сервер пришлет обновленное состояние в 'update',
-                     // но можно добавить лог или эффект респавна здесь
-                     if (message.payload.id === localPlayerId) {
-                         console.log("You respawned!");
-                         // Сброс локального ввода при респавне
-                         localInputState.keys = { w: false, a: false, s: false, d: false };
-                         localInputState.shooting = false;
-                     }
-                    break;
-                // Обработка других типов сообщений
-            }
-        }
-
-        // --- Обновление UI (HP, Kills) ---
-        function updateUI() {
-            const player = clientGameState.players[localPlayerId];
-            if (player) {
-                hpElement.textContent = player.hp;
-                maxHpElement.textContent = player.maxHp;
-                killsElement.textContent = player.kills;
-            } else {
-                 hpElement.textContent = 'N/A';
-                maxHpElement.textContent = 'N/A';
-                killsElement.textContent = 'N/A';
-            }
-        }
-
-         // --- Обновление лидерборда ---
-        function updateLeaderboard() {
-            const playersArray = Object.values(clientGameState.players);
-            playersArray.sort((a, b) => b.kills - a.kills); // Сортировка по убыванию убийств
-
-            leaderboardList.innerHTML = ''; // Очистить старый список
-
-            const topN = Math.min(playersArray.length, 10); // Показать топ-10
-            for (let i = 0; i < topN; i++) {
-                const player = playersArray[i];
-                const listItem = document.createElement('li');
-                 // Выделяем себя в списке
-                 listItem.textContent = `Player ${player.id}: ${player.kills} kills`;
-                 if (player.id === localPlayerId) {
-                    listItem.style.fontWeight = 'bold';
-                    listItem.style.color = 'yellow'; // Или другой цвет для выделения
-                }
-                leaderboardList.appendChild(listItem);
-            }
-        }
-
-
-        // --- Игровой цикл клиента (рендеринг) ---
-        function gameLoop() {
-            if (!socket || socket.readyState !== WebSocket.OPEN) {
-                console.log("Socket not ready, skipping game loop frame.");
-                 // Не вызываем requestAnimationFrame снова, если сокет закрыт
-                return;
-            }
-
-            resizeCanvas();
-            updateCamera();
-            draw();
-            sendInputIfNeeded(); // Отправляем ввод на сервер
-
-            requestAnimationFrame(gameLoop); // Запрашиваем следующий кадр
-        }
-
-        // --- Настройка размера Canvas ---
+        // --- Utility Functions ---
         function resizeCanvas() {
             canvas.width = window.innerWidth;
             canvas.height = window.innerHeight;
         }
 
-        // --- Обновление камеры ---
-        function updateCamera() {
-            const player = clientGameState.players[localPlayerId];
-            if (player && !player.dead) {
-                 // Плавное следование камеры (можно сделать проще - жесткое следование)
-                const targetX = player.x - canvas.width / 2;
-                const targetY = player.y - canvas.height / 2;
-                cameraX += (targetX - cameraX) * 0.1; // Плавность 0.1 (меньше = плавнее)
-                cameraY += (targetY - cameraY) * 0.1;
-
-                // Ограничиваем камеру границами карты
-                cameraX = Math.max(0, Math.min(MAP_SIZE - canvas.width, cameraX));
-                cameraY = Math.max(0, Math.min(MAP_SIZE - canvas.height, cameraY));
-
-            } else {
-                 // Если игрок мертв или еще не подключился, центрируем на середине карты
-                // cameraX = MAP_SIZE / 2 - canvas.width / 2;
-                // cameraY = MAP_SIZE / 2 - canvas.height / 2;
-                 // Или остаемся на последней позиции
-            }
-        }
-
-        // --- Рендеринг ---
-        function draw() {
-            // Очистка canvas
-            ctx.clearRect(0, 0, canvas.width, canvas.height);
-
-            // Смещение контекста для камеры
-            ctx.save();
-            ctx.translate(-cameraX, -cameraY);
-
-            // --- Рисуем фон/сетку (опционально) ---
-             drawGrid();
-
-             // --- Рисуем границу карты ---
-             ctx.strokeStyle = 'black';
-             ctx.lineWidth = 5;
-             ctx.strokeRect(0, 0, MAP_SIZE, MAP_SIZE);
-
-
-            // --- Рисуем всех игроков ---
-            for (const id in clientGameState.players) {
-                const player = clientGameState.players[id];
-                 if (player.dead) continue; // Не рисуем мертвых
-                 drawPlayer(player);
-            }
-
-            // --- Рисуем все пули ---
-            clientGameState.bullets.forEach(drawBullet);
-
-            // Восстановление контекста
-            ctx.restore();
-
-             // --- Рисуем элементы UI поверх всего ---
-             // UI (HP, Kills) уже обновляется через HTML элементы, но можно рисовать и на canvas
-
-             // --- Рисуем сообщение о смерти (если игрок мертв) ---
-            const localPlayer = clientGameState.players[localPlayerId];
-             if (localPlayer && localPlayer.dead) {
-                ctx.fillStyle = 'rgba(0, 0, 0, 0.7)';
-                ctx.fillRect(0, canvas.height / 2 - 30, canvas.width, 60);
-                ctx.font = '30px sans-serif';
-                ctx.fillStyle = 'red';
-                ctx.textAlign = 'center';
-                ctx.fillText(`You died! Respawning soon...`, canvas.width / 2, canvas.height / 2 + 10);
-            }
-        }
-
-         // --- Рисование сетки ---
-         function drawGrid() {
-            const gridSize = 50;
-            ctx.strokeStyle = '#ccc'; // Цвет сетки
-            ctx.lineWidth = 1;
-
-            // Оптимизация: Рисуем только видимую часть сетки
-            const startX = Math.floor(cameraX / gridSize) * gridSize;
-            const startY = Math.floor(cameraY / gridSize) * gridSize;
-            const endX = Math.ceil((cameraX + canvas.width) / gridSize) * gridSize;
-            const endY = Math.ceil((cameraY + canvas.height) / gridSize) * gridSize;
-
-            for (let x = startX; x < endX; x += gridSize) {
-                ctx.beginPath();
-                ctx.moveTo(x, startY);
-                ctx.lineTo(x, endY);
-                ctx.stroke();
-            }
-            for (let y = startY; y < endY; y += gridSize) {
-                ctx.beginPath();
-                ctx.moveTo(startX, y);
-                ctx.lineTo(endX, y);
-                ctx.stroke();
-            }
-        }
-
-
-        // --- Рисование игрока ---
+        // --- Drawing Functions ---
         function drawPlayer(player) {
-            // Тело танка
+             if (player.dead) return; // Don't draw dead players explicitly, maybe a marker later
+
+            const screenX = player.x - cameraX + canvas.width / 2;
+            const screenY = player.y - cameraY + canvas.height / 2;
+
+            // Draw body
             ctx.fillStyle = player.color;
             ctx.beginPath();
-            ctx.arc(player.x, player.y, player.radius, 0, Math.PI * 2);
+            ctx.arc(screenX, screenY, PLAYER_RADIUS, 0, Math.PI * 2);
             ctx.fill();
-            ctx.strokeStyle = 'black'; // Обводка
-             ctx.lineWidth = 2;
-             ctx.stroke();
+            ctx.strokeStyle = 'rgba(0, 0, 0, 0.5)';
+            ctx.lineWidth = 2;
+            ctx.stroke();
 
-
-            // Пушка
-            const cannonLength = player.radius * 1.3;
-            const cannonWidth = player.radius * 0.8;
+            // Draw turret
             ctx.save();
-            ctx.translate(player.x, player.y);
+            ctx.translate(screenX, screenY);
             ctx.rotate(player.angle);
             ctx.fillStyle = '#999';
-            ctx.fillRect(0, -cannonWidth / 2, cannonLength, cannonWidth);
+            ctx.fillRect(0, -TURRET_WIDTH / 2, TURRET_LENGTH, TURRET_WIDTH);
             ctx.strokeStyle = '#666';
             ctx.lineWidth = 1;
-            ctx.strokeRect(0, -cannonWidth / 2, cannonLength, cannonWidth);
+            ctx.strokeRect(0, -TURRET_WIDTH / 2, TURRET_LENGTH, TURRET_WIDTH);
             ctx.restore();
 
-            // Полоска HP
-            const hpBarWidth = player.radius * 1.5;
-            const hpBarHeight = 8;
-            const hpBarX = player.x - hpBarWidth / 2;
-            const hpBarY = player.y - player.radius - hpBarHeight - 5; // Над игроком
-            const hpPercent = player.hp / player.maxHp;
+            // Draw health bar
+            const healthPercentage = player.health / player.maxHealth;
+            const healthBarX = screenX - HEALTH_BAR_WIDTH / 2;
+            const healthBarY = screenY - PLAYER_RADIUS - HEALTH_BAR_HEIGHT - 5;
 
-            ctx.fillStyle = '#FF0000'; // Красный фон
-            ctx.fillRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
-            ctx.fillStyle = '#00FF00'; // Зеленый HP
-            ctx.fillRect(hpBarX, hpBarY, hpBarWidth * hpPercent, hpBarHeight);
-            ctx.strokeStyle = 'black';
+            ctx.fillStyle = '#ddd'; // Background
+            ctx.fillRect(healthBarX, healthBarY, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT);
+            ctx.fillStyle = healthPercentage > 0.5 ? '#00cc00' : healthPercentage > 0.2 ? '#cccc00' : '#cc0000'; // Health color
+            ctx.fillRect(healthBarX, healthBarY, HEALTH_BAR_WIDTH * healthPercentage, HEALTH_BAR_HEIGHT);
+            ctx.strokeStyle = '#555';
             ctx.lineWidth = 1;
-            ctx.strokeRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
+            ctx.strokeRect(healthBarX, healthBarY, HEALTH_BAR_WIDTH, HEALTH_BAR_HEIGHT);
 
-             // Имя/ID игрока (опционально)
-             ctx.fillStyle = 'black';
-             ctx.font = '12px sans-serif';
-             ctx.textAlign = 'center';
-             ctx.fillText(`Player ${player.id} (${player.kills})`, player.x, hpBarY - 4); // Над полоской HP
+             // Draw score or name (optional)
+            ctx.fillStyle = 'black';
+            ctx.textAlign = 'center';
+            ctx.font = '12px sans-serif';
+            // Simple ID display for now
+            ctx.fillText(`P:${player.id.split('_')[1]} (${player.score})`, screenX, screenY + PLAYER_RADIUS + 15);
+
+
+             // Indicate own player
+             if (player.id === myPlayerId) {
+                 ctx.strokeStyle = 'gold';
+                 ctx.lineWidth = 3;
+                 ctx.beginPath();
+                 ctx.arc(screenX, screenY, PLAYER_RADIUS + 5, 0, Math.PI * 2);
+                 ctx.stroke();
+             }
         }
 
-        // --- Рисование пули ---
         function drawBullet(bullet) {
-             // Находим цвет владельца пули
-             const owner = clientGameState.players[bullet.ownerId];
-             const bulletColor = owner ? owner.color : '#FFA500'; // Оранжевый по умолчанию, если владелец пропал
+            const screenX = bullet.x - cameraX + canvas.width / 2;
+            const screenY = bullet.y - cameraY + canvas.height / 2;
 
-            ctx.fillStyle = bulletColor; // Цвет пули как у игрока
+            ctx.fillStyle = '#555'; // Bullet color
             ctx.beginPath();
-            ctx.arc(bullet.x, bullet.y, bullet.radius, 0, Math.PI * 2);
+            ctx.arc(screenX, screenY, BULLET_RADIUS, 0, Math.PI * 2);
             ctx.fill();
-             ctx.strokeStyle = 'black'; // Обводка
-             ctx.lineWidth = 1;
-             ctx.stroke();
         }
 
-        // --- Отправка ввода на сервер ---
-        function sendInputIfNeeded() {
-             if (!socket || socket.readyState !== WebSocket.OPEN || localPlayerId === null) return;
+         function drawMapBoundary() {
+            const mapStartX = -cameraX + canvas.width / 2;
+            const mapStartY = -cameraY + canvas.height / 2;
+            const mapEndX = MAP_WIDTH - cameraX + canvas.width / 2;
+            const mapEndY = MAP_HEIGHT - cameraY + canvas.height / 2;
 
-             // Проверяем, изменилось ли что-то
-             const currentStateString = JSON.stringify(localInputState);
-             if (currentStateString !== lastSentInputState) {
-                 socket.send(JSON.stringify({ type: 'input', payload: localInputState }));
-                 lastSentInputState = currentStateString; // Сохраняем отправленное состояние
+            ctx.strokeStyle = '#aaa';
+            ctx.lineWidth = 5;
+            ctx.strokeRect(mapStartX, mapStartY, MAP_WIDTH, MAP_HEIGHT);
+         }
+
+        function updateScoreboard() {
+            const sortedPlayers = Object.values(players)
+                .filter(p => !p.dead) // Only show living players maybe? Or sort dead lower?
+                .sort((a, b) => b.score - a.score)
+                .slice(0, 10); // Show top 10
+
+            scoreList.innerHTML = ''; // Clear previous list
+            sortedPlayers.forEach(player => {
+                const li = document.createElement('li');
+                // Simple ID display for now
+                li.textContent = `P:${player.id.split('_')[1]} - ${player.score}`;
+                if(player.id === myPlayerId) {
+                   li.style.fontWeight = 'bold';
+                   li.style.color = 'gold';
+                }
+                scoreList.appendChild(li);
+            });
+        }
+
+        // --- Game Loop (Client) ---
+        function gameLoop() {
+            if (!connected || !myPlayerId) {
+                requestAnimationFrame(gameLoop); // Keep trying if not connected yet
+                return;
+            }
+
+            // --- Update Logic ---
+            const myPlayer = players[myPlayerId];
+
+            // Calculate angle towards mouse
+            if (myPlayer && !myPlayer.dead) {
+                const screenX = myPlayer.x - cameraX + canvas.width / 2;
+                const screenY = myPlayer.y - cameraY + canvas.height / 2;
+                const angle = Math.atan2(mouseY - screenY, mouseX - screenX);
+
+                // Send angle update if changed significantly
+                if (Math.abs(angle - lastSentAngle) > 0.05) { // Threshold to reduce network traffic
+                     send({ type: 'angle', angle: angle });
+                     lastSentAngle = angle; // Store the actually sent angle
+                }
+
+                // Center camera on player
+                cameraX = myPlayer.x;
+                cameraY = myPlayer.y;
+            } else if(myPlayer && myPlayer.dead) {
+               // Maybe slowly pan camera or show death message
+            } else {
+                 // If player data not yet received, center camera at 0,0
+                 cameraX = MAP_WIDTH / 2;
+                 cameraY = MAP_HEIGHT / 2;
+            }
+
+
+            // --- Rendering ---
+            // Clear canvas
+            ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+            // Draw map boundaries (optional)
+             drawMapBoundary();
+
+            // Draw bullets first (under players)
+            for (const bulletId in bullets) {
+                drawBullet(bullets[bulletId]);
+            }
+
+            // Draw players
+            const playerIds = Object.keys(players).sort((a, b) => {
+                 // Draw own player last (on top)
+                 if (a === myPlayerId) return 1;
+                 if (b === myPlayerId) return -1;
+                 return 0;
+            });
+
+            playerIds.forEach(playerId => {
+                 drawPlayer(players[playerId]);
+            });
+
+
+            // Update scoreboard
+            updateScoreboard();
+
+            // Request next frame
+            requestAnimationFrame(gameLoop);
+        }
+
+        // --- WebSocket Communication ---
+        function connectWebSocket() {
+            // Use wss:// if the main page is served over https, otherwise ws://
+            const wsProtocol = window.location.protocol === 'https:' ? 'wss://' : 'ws://';
+            const wsUrl = `${wsProtocol}${window.location.host}`; // Connect to the same host serving the HTML
+
+            console.log(`Connecting to WebSocket: ${wsUrl}`);
+            ws = new WebSocket(wsUrl);
+
+            ws.onopen = () => {
+                console.log('WebSocket connection established.');
+                connected = true;
+                disconnectMessage.style.display = 'none'; // Hide disconnect message
+            };
+
+            ws.onmessage = (event) => {
+                try {
+                    const data = JSON.parse(event.data);
+                    // console.log('Received:', data.type); // Debugging
+
+                    switch (data.type) {
+                        case 'welcome':
+                            myPlayerId = data.playerId;
+                            players = data.initialState.players || {}; // Load initial state
+                            bullets = data.initialState.bullets || {};
+                            console.log(`Assigned Player ID: ${myPlayerId}`);
+                            break;
+                        case 'update':
+                            // Simple state replacement - could be optimized later
+                            players = data.players || {};
+                            bullets = data.bullets || {};
+                            break;
+                         case 'playerJoined':
+                            if(data.player && data.player.id !== myPlayerId) {
+                               players[data.player.id] = data.player;
+                               console.log(`Player ${data.player.id} joined`);
+                            }
+                             break;
+                        case 'playerLeft':
+                            delete players[data.playerId];
+                            console.log(`Player ${data.playerId} left`);
+                            break;
+                         case 'playerDied':
+                             console.log(`Player ${data.playerId} died.`);
+                             if (players[data.playerId]) {
+                                 players[data.playerId].dead = true; // Mark as dead visually
+                                 players[data.playerId].health = 0; // Ensure health is 0
+                             }
+                             // Could show a message if killerId === myPlayerId
+                             break;
+                        // Add other message types as needed (e.g., specific events)
+                    }
+                } catch (error) {
+                    console.error('Failed to parse message or invalid message format:', event.data, error);
+                }
+            };
+
+            ws.onclose = () => {
+                console.log('WebSocket connection closed.');
+                connected = false;
+                myPlayerId = null;
+                players = {};
+                bullets = {};
+                disconnectMessage.style.display = 'block'; // Show disconnect message
+                // Optionally attempt to reconnect after a delay
+                // setTimeout(connectWebSocket, 5000);
+            };
+
+            ws.onerror = (error) => {
+                console.error('WebSocket error:', error);
+                // ws.onclose will likely be called after this
+                 disconnectMessage.style.display = 'block'; // Show disconnect message early
+            };
+        }
+
+        function send(data) {
+            if (ws && ws.readyState === WebSocket.OPEN) {
+                ws.send(JSON.stringify(data));
+            }
+        }
+
+        // --- Input Event Listeners ---
+        function handleKeyDown(event) {
+            let inputChanged = false;
+            switch (event.key.toLowerCase()) {
+                case 'w': case 'arrowup':    if (!keys.w) { keys.w = true; inputChanged = true; } break;
+                case 'a': case 'arrowleft':  if (!keys.a) { keys.a = true; inputChanged = true; } break;
+                case 's': case 'arrowdown':  if (!keys.s) { keys.s = true; inputChanged = true; } break;
+                case 'd': case 'arrowright': if (!keys.d) { keys.d = true; inputChanged = true; } break;
+                case ' ': // Shoot with spacebar
+                    if (!isShooting) {
+                       isShooting = true;
+                       send({ type: 'shoot' });
+                       // Add client-side cooldown visualization if needed
+                    }
+                    break;
+            }
+            if (inputChanged) {
+                // Send input only if it actually changed
+                 const currentInput = { up: keys.w, down: keys.s, left: keys.a, right: keys.d };
+                 if (JSON.stringify(currentInput) !== JSON.stringify(lastSentInput)) {
+                     send({ type: 'input', input: currentInput });
+                     lastSentInput = currentInput;
+                 }
+            }
+        }
+
+        function handleKeyUp(event) {
+             let inputChanged = false;
+            switch (event.key.toLowerCase()) {
+                case 'w': case 'arrowup':    if (keys.w) { keys.w = false; inputChanged = true; } break;
+                case 'a': case 'arrowleft':  if (keys.a) { keys.a = false; inputChanged = true; } break;
+                case 's': case 'arrowdown':  if (keys.s) { keys.s = false; inputChanged = true; } break;
+                case 'd': case 'arrowright': if (keys.d) { keys.d = false; inputChanged = true; } break;
+                 case ' ':
+                    isShooting = false;
+                    break;
+            }
+             if (inputChanged) {
+                  const currentInput = { up: keys.w, down: keys.s, left: keys.a, right: keys.d };
+                  send({ type: 'input', input: currentInput });
+                  lastSentInput = currentInput;
              }
         }
 
-        // --- Обработчики событий ввода ---
-        window.addEventListener('keydown', (e) => {
-            let changed = false;
-            switch (e.key.toLowerCase()) {
-                case 'w': case 'arrowup':    if (!localInputState.keys.w) { localInputState.keys.w = true; changed = true; } break;
-                case 'a': case 'arrowleft':  if (!localInputState.keys.a) { localInputState.keys.a = true; changed = true; } break;
-                case 's': case 'arrowdown':  if (!localInputState.keys.s) { localInputState.keys.s = true; changed = true; } break;
-                case 'd': case 'arrowright': if (!localInputState.keys.d) { localInputState.keys.d = true; changed = true; } break;
+        function handleMouseMove(event) {
+            mouseX = event.clientX;
+            mouseY = event.clientY;
+            // Angle calculation and sending is handled in the game loop to use player position
+        }
+
+        function handleMouseDown(event) {
+            // Left mouse button for shooting
+            if (event.button === 0) {
+                send({ type: 'shoot' });
+                 // Client-side throttling could be added here too,
+                 // but server already has cooldown
             }
-             // if (changed) sendInputIfNeeded(); // Можно отправлять сразу, но лучше в цикле
-        });
+        }
 
-        window.addEventListener('keyup', (e) => {
-            let changed = false;
-            switch (e.key.toLowerCase()) {
-                case 'w': case 'arrowup':    if (localInputState.keys.w) { localInputState.keys.w = false; changed = true; } break;
-                case 'a': case 'arrowleft':  if (localInputState.keys.a) { localInputState.keys.a = false; changed = true; } break;
-                case 's': case 'arrowdown':  if (localInputState.keys.s) { localInputState.keys.s = false; changed = true; } break;
-                case 'd': case 'arrowright': if (localInputState.keys.d) { localInputState.keys.d = false; changed = true; } break;
-            }
-             // if (changed) sendInputIfNeeded();
-        });
+        // --- Initialization ---
+        window.addEventListener('resize', resizeCanvas);
+        document.addEventListener('keydown', handleKeyDown);
+        document.addEventListener('keyup', handleKeyUp);
+        canvas.addEventListener('mousemove', handleMouseMove);
+        canvas.addEventListener('mousedown', handleMouseDown); // Use mousedown for continuous shooting if held
 
-        window.addEventListener('mousemove', (e) => {
-             const player = clientGameState.players[localPlayerId];
-             if (!player || player.dead) return; // Не обновлять угол, если игрок мертв
-
-            // Получаем позицию мыши относительно canvas
-            const rect = canvas.getBoundingClientRect();
-            const mouseX = e.clientX - rect.left;
-            const mouseY = e.clientY - rect.top;
-
-            // Рассчитываем угол от центра игрока (в экранных координатах) к мыши
-            const playerScreenX = player.x - cameraX;
-            const playerScreenY = player.y - cameraY;
-            const angle = Math.atan2(mouseY - playerScreenY, mouseX - playerScreenX);
-
-             if (localInputState.angle !== angle) {
-                 localInputState.angle = angle;
-                // sendInputIfNeeded();
-             }
-        });
-
-        window.addEventListener('mousedown', (e) => {
-            // Левая кнопка мыши
-            if (e.button === 0 && !localInputState.shooting) {
-                 localInputState.shooting = true;
-                // sendInputIfNeeded();
-            }
-        });
-
-        window.addEventListener('mouseup', (e) => {
-             if (e.button === 0 && localInputState.shooting) {
-                 localInputState.shooting = false;
-                // sendInputIfNeeded();
-             }
-        });
-
-        // Запрет контекстного меню на canvas
-        canvas.addEventListener('contextmenu', (e) => e.preventDefault());
-
-        // --- Запуск ---
-        resizeCanvas(); // Установить начальный размер
-        window.addEventListener('resize', resizeCanvas); // Обновлять при изменении размера окна
-        connectWebSocket(); // Начать подключение к серверу
+        resizeCanvas();
+        connectWebSocket();
+        gameLoop(); // Start the client-side rendering loop
 
     </script>
 </body>
