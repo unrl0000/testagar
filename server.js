@@ -311,10 +311,18 @@ function resetJoystick(){
      // inputState.mouseY = canvas.height / 2 + camera.y;
 }
 
+// Модифицируем функцию updateJoystickThumb и updateInputFromJoystick
 function updateJoystickThumb() {
     let dx = joystickCurrentX - joystickStartX;
     let dy = joystickCurrentY - joystickStartY;
     const distance = Math.sqrt(dx * dx + dy * dy);
+
+    // Добавляем мертвую зону
+    const deadZone = JOYSTICK_RADIUS * 0.15;
+    if (distance < deadZone) {
+        joystickThumb.style.transform = `translate(0px, 0px)`;
+        return;
+    }
 
     let clampedX = dx;
     let clampedY = dy;
@@ -332,7 +340,7 @@ function updateInputFromJoystick() {
     let dx = joystickCurrentX - joystickStartX;
     let dy = joystickCurrentY - joystickStartY;
     const distance = Math.sqrt(dx * dx + dy * dy);
-    const threshold = JOYSTICK_RADIUS * 0.1; // Minimum movement to register
+    const threshold = JOYSTICK_RADIUS * 0.15; // Увеличиваем мертвую зону
 
     if (distance < threshold) {
         inputState.up = false;
@@ -342,20 +350,21 @@ function updateInputFromJoystick() {
         return;
     }
 
+    // Используем более плавную реакцию, основанную на величине отклонения
     const angle = Math.atan2(dy, dx);
-
-    // Update movement direction based on angle
-    inputState.up = (angle > -Math.PI * 0.875 && angle < -Math.PI * 0.125);
-    inputState.down = (angle > Math.PI * 0.125 && angle < Math.PI * 0.875);
-    inputState.left = (angle > Math.PI * 0.625 || angle < -Math.PI * 0.625);
-    inputState.right = (angle > -Math.PI * 0.375 && angle < Math.PI * 0.375);
-
-     // Update aiming direction based on joystick
-     // Convert joystick delta to world coordinates for aiming
-     const worldAimX = camera.x + dx * 5; // Scale dx for aiming "reach"
-     const worldAimY = camera.y + dy * 5; // Scale dy for aiming "reach"
-     inputState.mouseX = worldAimX;
-     inputState.mouseY = worldAimY;
+    const normalizedDistance = Math.min(distance / MAX_JOYSTICK_DIST, 1);
+    
+    // Смягчаем управление - использование векторов вместо булевых флагов
+    inputState.up = Math.cos(angle - Math.PI/2) * normalizedDistance > 0.3;
+    inputState.down = Math.cos(angle - Math.PI/2) * normalizedDistance < -0.3;
+    inputState.left = Math.cos(angle) * normalizedDistance < -0.3;
+    inputState.right = Math.cos(angle) * normalizedDistance > 0.3;
+    
+    // Обновляем прицеливание
+    const worldAimX = camera.x + dx * 5; 
+    const worldAimY = camera.y + dy * 5;
+    inputState.mouseX = worldAimX;
+    inputState.mouseY = worldAimY;
 }
 
 
@@ -441,10 +450,12 @@ function gameLoop(timestamp) {
     // Clear canvas
     ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-    // Update camera to follow player
+    // Обновите камеру с плавным переходом
     if (selfPlayer) {
-        camera.x = selfPlayer.x;
-        camera.y = selfPlayer.y;
+        // Вместо прямого присваивания используем интерполяцию
+        const cameraLerpFactor = 0.08; // Чем меньше, тем плавнее
+        camera.x += (selfPlayer.x - camera.x) * cameraLerpFactor;
+        camera.y += (selfPlayer.y - camera.y) * cameraLerpFactor;
     }
 
     // Translate canvas to camera position
@@ -506,11 +517,21 @@ function drawOrbs(orbs) {
 
 function drawProjectiles(projectiles) {
     projectiles.forEach(proj => {
-          if(isElementVisible(proj, proj.radius * 2)) {
+        if(isElementVisible(proj, proj.radius * 2)) {
+            // Добавляем эффект "хвоста" для снарядов
             ctx.fillStyle = proj.color || '#ffffff';
             ctx.beginPath();
             ctx.arc(proj.x, proj.y, proj.radius, 0, Math.PI * 2);
             ctx.fill();
+            
+            // Добавляем след для наглядности
+            ctx.strokeStyle = proj.color || '#ffffff';
+            ctx.globalAlpha = 0.5;
+            ctx.beginPath();
+            ctx.moveTo(proj.x, proj.y);
+            ctx.lineTo(proj.x - proj.dx*3, proj.y - proj.dy*3);
+            ctx.stroke();
+            ctx.globalAlpha = 1.0;
         }
     });
 }
@@ -551,6 +572,14 @@ function drawPlayers(players) {
             ctx.strokeRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
         }
     });
+    // Добавьте визуальный индикатор получения урона
+    if (player.lastDamage && Date.now() - player.lastDamage < 300) {
+        ctx.strokeStyle = '#ff0000';
+        ctx.lineWidth = 4;
+        ctx.beginPath();
+        ctx.arc(player.x, player.y, player.radius * 1.2, 0, Math.PI * 2);
+        ctx.stroke();
+    }
 }
 
 function drawUI(selfPlayer) {
