@@ -1,22 +1,18 @@
 {
-  "name": "agar-node",
+  "name": "dipper-io",
   "version": "1.0.0",
-  "description": "Simple Agar.io clone with Node.js",
+  "description": "A simple browser multiplayer game like diep.io",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
     "test": "echo \"Error: no test specified\" && exit 1"
   },
-  "keywords": [
-    "agar",
-    "game",
-    "socket.io",
-    "node"
-  ],
-  "author": "",
+  "engines": {
+    "node": ">=14.0.0" 
+  },
+  "author": "Your Name",
   "license": "ISC",
   "dependencies": {
-    "express": "^4.18.2",
-    "socket.io": "^4.7.2"
+    "ws": "^8.8.0"
   }
 }
