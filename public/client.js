@@ -1,6 +1,6 @@
-// client.js
+// public/client.js
 const canvas = document.getElementById('game-canvas');
-const ctx = canvas.getContext('2d');
+const ctx = canvas.getContext('2d'); // Use '2d' context
 
 // --- DOM Elements ---
 const startScreen = document.getElementById('start-screen');
@@ -19,96 +19,84 @@ const attackButton = document.getElementById('attack-button');
 // --- Network State ---
 let ws;
 let selfId = null;
-let serverTimeOffset = 0; // Rough estimate of time difference with server
-let latency = 0; // Rough estimate of round-trip time / 2
+let serverTimeOffset = 0; // Not implemented robustly yet
+let latency = 0;
 
 // --- Game State ---
-let players = new Map(); // Stores player data received from server { data: playerData, interpBuffer: [], renderX, renderY }
-let orbs = []; // Simple array of orbs
-let projectiles = []; // Simple array of projectiles
+// Use Maps for efficient lookup/update/removal of players
+let players = new Map(); // { data: serverData, interpBuffer: [], renderX, renderY }
+let orbs = new Map();    // Store orbs by ID for potential easier removal/update
+let projectiles = new Map(); // Store projectiles by ID
+
 let mapWidth = 2000;
 let mapHeight = 2000;
 let lastServerTimestamp = 0;
 
 // --- Self Player State (Client-Side Prediction) ---
-// Initialize with default off-screen values until welcome message arrives
-let predictedState = { x: -1000, y: -1000, isDead: true, radius: PLAYER_RADIUS }; // Start as "dead" and off-screen
+let predictedState = { x: 0, y: 0, isDead: true, radius: 15 }; // Start as dead until welcome
 let inputHistory = [];
 let inputSequenceNumber = 0;
 
 // --- Input State ---
 let inputState = { up: false, down: false, left: false, right: false, attack: false, mouseX: 0, mouseY: 0 };
-let lastSentInputState = {};
 let mouseScreenX = window.innerWidth / 2;
 let mouseScreenY = window.innerHeight / 2;
 
 // --- Camera State ---
-let camera = { x: -1000, y: -1000, targetX: -1000, targetY: -1000, speed: 0.1 };
+let camera = { x: 0, y: 0, targetX: 0, targetY: 0, speed: 0.15 }; // Slightly faster camera
 
 // --- Touch Control State ---
 let touchIdentifier = null;
 let joystickActive = false;
-let joystickStartX = 0;
-let joystickStartY = 0;
-let joystickCurrentX = 0;
-let joystickCurrentY = 0;
-let aimFromJoystick = { x: 0, y: 0 }; // Store aim direction derived from joystick separately
+let joystickStartX = 0, joystickStartY = 0, joystickCurrentX = 0, joystickCurrentY = 0;
+let aimFromJoystick = { x: 0, y: 0 };
 let isTouchDevice = false;
-const JOYSTICK_BASE_RADIUS = 60; // Reference radius of the base
-const THUMB_BASE_RADIUS = 30;  // Reference radius of the thumb
+const JOYSTICK_BASE_RADIUS = 60;
+const THUMB_BASE_RADIUS = 30;
 let joystickRadius = JOYSTICK_BASE_RADIUS;
 let thumbRadius = THUMB_BASE_RADIUS;
 let maxJoystickDist = joystickRadius - thumbRadius;
-const JOYSTICK_DEAD_ZONE = 0.15; // Percentage of radius (15%)
+const JOYSTICK_DEAD_ZONE = 0.15;
 
 // --- Constants ---
-const INTERPOLATION_DELAY = 100;
-const PLAYER_RADIUS = 15; // Base radius, might change with class
-const PLAYER_SPEED = 2.5;
-const BASE_TICK_RATE = 60;
-const XP_TO_LEVEL_2 = 100; // Keep in sync with server
+const INTERPOLATION_DELAY = 100; // ms - Render others slightly in the past
+let PLAYER_BASE_SPEED = 2.5; // Default, updated from server constants
+let BASE_TICK_RATE = 60;     // Default, updated from server constants
 
 // --- Game Loop Control ---
 let lastFrameTime = performance.now();
-let gameLoopId = null;
-let isGameLoopRunning = false; // Flag to control loop execution
-
-// --- Optimization Cache ---
-let canvasHalfWidth = window.innerWidth / 2;
-let canvasHalfHeight = window.innerHeight / 2;
-
+let gameLoopId = null; // Stores the requestAnimationFrame ID
+let inputIntervalId = null; // Stores the setInterval ID for input sending
 
 // =============================================================================
 // INITIALIZATION & SETUP
 // =============================================================================
 
 function init() {
-    console.log("Initializing client...");
+    console.log("Client Initializing...");
     isTouchDevice = ('ontouchstart' in window) || (navigator.maxTouchPoints > 0);
-    console.log("Is Touch Device:", isTouchDevice);
+    console.log("Touch Device:", isTouchDevice);
 
     setupStartScreen();
-    setupInputListeners();
-    resizeCanvas(); // Set initial size and cache half-dimensions
+    setupInputListeners(); // Keyboard + Mouse
+    resizeCanvas(); // Initial size
     window.addEventListener('resize', resizeCanvas);
 
     if (isTouchDevice) {
-        touchControls.style.display = 'block';
+        touchControls.style.display = 'block'; // Show touch controls if detected
         setupTouchControls();
+    } else {
+        touchControls.style.display = 'none'; // Hide if not touch
     }
-    console.log("Initialization complete. Waiting for connection...");
+    console.log("Initialization sequence complete.");
 }
 
 function resizeCanvas() {
     canvas.width = window.innerWidth;
     canvas.height = window.innerHeight;
-    // Cache half dimensions for performance
-    canvasHalfWidth = canvas.width / 2;
-    canvasHalfHeight = canvas.height / 2;
 
-    // Recalculate joystick dimensions based on screen size if needed
-    // Example: Make joystick slightly smaller on very small screens
-    const scaleFactor = Math.min(1, window.innerWidth / 600); // Scale down if width < 600px
+    // Responsive joystick size adjustments
+    const scaleFactor = Math.min(1, Math.max(0.7, window.innerWidth / 800)); // Scale between 70% and 100%
     joystickRadius = JOYSTICK_BASE_RADIUS * scaleFactor;
     thumbRadius = THUMB_BASE_RADIUS * scaleFactor;
     maxJoystickDist = joystickRadius - thumbRadius;
@@ -117,11 +105,10 @@ function resizeCanvas() {
     joystickArea.style.height = `${joystickRadius * 2}px`;
     joystickThumb.style.width = `${thumbRadius * 2}px`;
     joystickThumb.style.height = `${thumbRadius * 2}px`;
-    // Center the thumb initially
-    joystickThumb.style.top = `${joystickRadius - thumbRadius}px`;
+    joystickThumb.style.top = `${joystickRadius - thumbRadius}px`; // Center thumb
     joystickThumb.style.left = `${joystickRadius - thumbRadius}px`;
 
-    console.log("Canvas resized:", canvas.width, canvas.height);
+    console.log("Canvas Resized:", canvas.width, canvas.height);
 }
 
 function setupStartScreen() {
@@ -129,7 +116,6 @@ function setupStartScreen() {
         button.addEventListener('click', () => {
             raceButtons.forEach(btn => btn.classList.remove('selected'));
             button.classList.add('selected');
-            selectedRace = button.getAttribute('data-race');
         });
     });
     startButton.addEventListener('click', joinGame);
@@ -145,17 +131,21 @@ function joinGame() {
 
     console.log(`Attempting to join as ${name} (${selectedRace})`);
     startScreen.style.display = 'none';
-    canvas.style.display = 'block';
+    canvas.style.display = 'block'; // Show canvas
     errorMessage.textContent = '';
-    if (isTouchDevice) touchControls.style.display = 'block'; // Ensure touch controls are visible
+    if (isTouchDevice) touchControls.style.display = 'block';
+
+    // Stop existing game loop and intervals before connecting
+    stopGameLoop();
+    stopInputInterval();
 
     connectWebSocket(name, selectedRace);
 }
 
 function showError(message) {
-    console.error("Error:", message);
+    console.error("UI Error:", message);
     errorMessage.textContent = message;
-    // Consider showing start screen again on critical errors
+    // Optional: Show start screen on error
     // startScreen.style.display = 'block';
     // canvas.style.display = 'none';
     // touchControls.style.display = 'none';
@@ -167,61 +157,45 @@ function showError(message) {
 
 function connectWebSocket(name, race) {
     if (ws && ws.readyState === WebSocket.OPEN) {
-        console.warn("WebSocket already open.");
-        return;
+        console.warn("Closing existing WebSocket connection.");
+        ws.close();
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss' : 'ws';
     const wsUrl = `${protocol}://${window.location.host}`;
-    console.log(`Connecting to ${wsUrl}`);
+    console.log(`Connecting to: ${wsUrl}`);
     ws = new WebSocket(wsUrl);
 
     ws.onopen = () => {
-        console.log('WebSocket connection established.');
-        // Reset state for new connection
+        console.log('WebSocket Connected.');
+        // Reset game state variables for new connection
         selfId = null;
         players.clear();
+        orbs.clear();
+        projectiles.clear();
         inputHistory = [];
         inputSequenceNumber = 0;
+        predictedState = { x: 0, y: 0, isDead: true, radius: 15 }; // Reset prediction
+        camera.x = 0; camera.y = 0; // Reset camera
+
         // Send join message
         ws.send(JSON.stringify({ type: 'join', name: name, race: race }));
-        // Start pinging for latency estimation (optional)
-        // setInterval(sendPing, 2000);
     };
 
     ws.onmessage = (event) => {
         try {
             const message = JSON.parse(event.data);
-            // console.log('Received message:', message.type); // DEBUG
-
-            // Process message only if WS is open
-            if (ws.readyState !== WebSocket.OPEN) return;
-
             switch (message.type) {
-                case 'welcome':
-                    handleWelcome(message);
+                case 'welcome': handleWelcome(message); break;
+                case 'gameState': handleGameState(message); break;
+                case 'levelUpReady': showLevel2Selection(); break;
+                case 'classSelected':
+                    console.log("Server confirmed class selection.");
+                    level2SelectionScreen.style.display = 'none'; // Hide screen
+                    // Player data update comes via next gameState
                     break;
-                case 'gameState':
-                    // Ensure game loop is running before processing state
-                    if (isGameLoopRunning) {
-                        handleGameState(message);
-                    } else {
-                         console.log("Received gameState before loop started, queuing or ignoring?");
-                         // Maybe store the first state? For now, let's rely on welcome state + subsequent states
-                    }
-                    break;
-                 case 'levelUpReady':
-                     if (isGameLoopRunning) showLevel2Selection();
-                     break;
-                 case 'classSelected':
-                      if (isGameLoopRunning) level2SelectionScreen.style.display = 'none';
-                     break;
-                 case 'pong': // Handle ping response
-                     // latency = (Date.now() - message.clientTime) / 2;
-                     // console.log(`Ping: ${latency.toFixed(0)}ms`);
-                     break;
-                default:
-                    console.warn("Received unknown message type:", message.type);
+                case 'pong': /* Latency calculation */ break;
+                default: console.warn("Unknown message type:", message.type);
             }
         } catch (error) {
             console.error('Error processing message:', event.data, error);
@@ -229,266 +203,305 @@ function connectWebSocket(name, race) {
     };
 
     ws.onerror = (error) => {
-        console.error('WebSocket error:', error);
+        console.error('WebSocket Error:', error);
         showError('Connection error. Please refresh.');
-        stopGameLoop(); // Stop loop on error
-        resetClientState();
+        stopGameLoop();
+        stopInputInterval();
     };
 
     ws.onclose = (event) => {
-        console.log(`WebSocket connection closed: Code=${event.code}, Reason=${event.reason}`);
-        showError('Disconnected from server. Please refresh.');
-        stopGameLoop(); // Stop loop on close
-        resetClientState(); // Reset state and show start screen
+        console.log(`WebSocket Closed: Code=${event.code}, Reason=${event.reason}`);
+        showError('Disconnected. Please refresh.');
+        stopGameLoop();
+        stopInputInterval();
+        selfId = null; // Mark as disconnected
+        // Show start screen
+        startScreen.style.display = 'block';
+        canvas.style.display = 'none';
+        touchControls.style.display = 'none';
+        level2SelectionScreen.style.display = 'none';
     };
 }
 
-
 function handleWelcome(message) {
-     // Ensure we haven't already initialized
-     if (selfId) {
-         console.warn("Received welcome message again, ignoring.");
+    if (selfId) {
+         console.warn("Received welcome message again? Ignoring.");
          return;
-     }
+    }
     selfId = message.playerId;
     mapWidth = message.mapWidth;
     mapHeight = message.mapHeight;
-    console.log(`Joined game! Player ID: ${selfId}, Map: ${mapWidth}x${mapHeight}`);
 
-    // Immediately process the initial state if provided in welcome
-    let initialPlayerFound = false;
+    // Update constants if provided by server
+    if(message.constants) {
+        PLAYER_BASE_SPEED = message.constants.PLAYER_BASE_SPEED || PLAYER_BASE_SPEED;
+        BASE_TICK_RATE = message.constants.BASE_TICK_RATE || BASE_TICK_RATE;
+         console.log(`Updated constants: Speed=${PLAYER_BASE_SPEED}, TickRate=${BASE_TICK_RATE}`);
+    }
+
+    console.log(`Welcome! Player ID: ${selfId}, Map: ${mapWidth}x${mapHeight}`);
+
+    // Process initial state IMMEDIATELY
     if (message.initialState) {
-        // Use current time as base for the initial state
-        processServerState(message.initialState, Date.now());
-        const selfData = players.get(selfId)?.data;
-        if (selfData) {
-             // Set initial predicted state based on received data
-            predictedState.x = selfData.x;
-            predictedState.y = selfData.y;
-            predictedState.isDead = selfData.isDead;
-            predictedState.radius = selfData.radius || PLAYER_RADIUS; // Ensure radius is set
-
-             // Set initial camera position *directly* to avoid jump
-             camera.x = predictedState.x;
-             camera.y = predictedState.y;
-             camera.targetX = predictedState.x;
-             camera.targetY = predictedState.y;
-
-             console.log(`Initial state processed. Predicted pos: ${predictedState.x.toFixed(1)}, ${predictedState.y.toFixed(1)}, Camera pos: ${camera.x.toFixed(1)}, ${camera.y.toFixed(1)}`);
-             initialPlayerFound = true;
-        } else {
-             console.error("CRITICAL: Self player data not found in initial state provided by welcome message!");
-             // Fallback - place somewhere visible, but this indicates a server issue
-             predictedState.x = mapWidth / 2;
-             predictedState.y = mapHeight / 2;
-             predictedState.isDead = false; // Assume alive
-             camera.x = camera.targetX = predictedState.x;
-             camera.y = camera.targetY = predictedState.y;
-        }
+        processServerState(message.initialState, Date.now()); // Use current time approx
     } else {
-         console.error("CRITICAL: No initial state provided in welcome message!");
-         // Need fallback or request state?
-         return; // Cannot start game loop without initial state
+        console.warn("No initial state received in welcome message!");
     }
 
-    // Start the game loop ONLY if we successfully got initial state
-    if (initialPlayerFound) {
-        startGameLoop();
-        // Start sending input periodically
-        setInterval(sendInputToServer, 1000 / 30);
+    // --- CRITICAL: Initialize Predicted State & Camera ---
+    const selfInitialData = players.get(selfId)?.data;
+    if (selfInitialData) {
+        predictedState.x = selfInitialData.x;
+        predictedState.y = selfInitialData.y;
+        predictedState.isDead = selfInitialData.isDead;
+        predictedState.radius = selfInitialData.radius;
+        // Set camera instantly to player start position
+        camera.x = predictedState.x;
+        camera.y = predictedState.y;
+        camera.targetX = predictedState.x;
+        camera.targetY = predictedState.y;
+        console.log(`Initial state processed. Self at: ${predictedState.x.toFixed(1)}, ${predictedState.y.toFixed(1)} Dead: ${predictedState.isDead}`);
     } else {
-         showError("Failed to initialize player state. Please refresh.");
+        console.error("!!! Self player data not found in initial state after welcome!");
+        // Fallback - place in center, likely still invisible if server doesn't send update soon
+        predictedState.x = mapWidth / 2;
+        predictedState.y = mapHeight / 2;
+        camera.x = predictedState.x; camera.y = predictedState.y;
+        camera.targetX = predictedState.x; camera.targetY = predictedState.y;
     }
+
+    // Start game loop and input sending ONLY after welcome and initial state processing
+    startGameLoop();
+    startInputInterval();
 }
 
 function handleGameState(message) {
-    // Estimate server time? Basic approach: assume message timestamp is close enough for now
-    // A more robust solution involves clock synchronization.
-    const serverTime = message.timestamp || Date.now(); // Fallback if timestamp missing
+    if (!selfId) return; // Ignore state updates before welcome
+    const serverTime = message.timestamp || Date.now();
     lastServerTimestamp = serverTime;
-
     processServerState(message, serverTime);
 }
 
 function processServerState(state, serverTime) {
-    // Update Orbs & Projectiles (simple replacement)
-    orbs = state.orbs || [];
-    projectiles = state.projectiles || [];
+    // --- Update Orbs (using Map) ---
+    const currentOrbIds = new Set();
+    (state.orbs || []).forEach(orbData => {
+        currentOrbIds.add(orbData.id);
+        orbs.set(orbData.id, orbData); // Add or update orb data
+    });
+    // Remove orbs no longer present
+    for (const orbId of orbs.keys()) {
+        if (!currentOrbIds.has(orbId)) {
+            orbs.delete(orbId);
+        }
+    }
 
-    // Update Players (more complex due to interpolation & prediction)
+    // --- Update Projectiles (using Map) ---
+    const currentProjIds = new Set();
+     (state.projectiles || []).forEach(projData => {
+         currentProjIds.add(projData.id);
+         // Simple replacement - could interpolate projectiles too for smoothness
+         projectiles.set(projData.id, projData);
+     });
+     // Remove projectiles no longer present
+     for (const projId of projectiles.keys()) {
+         if (!currentProjIds.has(projId)) {
+             projectiles.delete(projId);
+         }
+     }
+
+    // --- Update Players ---
     const receivedPlayerIds = new Set();
-    state.players.forEach(playerData => {
+    (state.players || []).forEach(playerData => {
         receivedPlayerIds.add(playerData.id);
 
         if (playerData.id === selfId) {
-            // --- Handle Self Player Reconciliation ---
-             handleSelfPlayerState(playerData);
+            handleSelfPlayerState(playerData);
         } else {
-            // --- Handle Other Players Interpolation ---
             handleOtherPlayerState(playerData, serverTime);
         }
     });
 
-     // Remove players that are no longer in the state message
-     const playersToRemove = [];
-     for (const id of players.keys()) {
-         if (id !== selfId && !receivedPlayerIds.has(id)) {
-             playersToRemove.push(id);
-         }
-     }
-     playersToRemove.forEach(id => {
-         console.log(`Removing player ${id} (not in state)`);
-         players.delete(id);
-     });
+    // Remove players (except self) that are no longer in the state message
+    for (const id of players.keys()) {
+        if (id !== selfId && !receivedPlayerIds.has(id)) {
+            // console.log(`Removing player ${id} (not in state)`); // DEBUG
+            players.delete(id);
+        }
+    }
 }
+
+// --- State Handling for Self and Others ---
 
 function handleSelfPlayerState(serverPlayerData) {
-     // This is the server's authoritative state for our player
-     const serverState = {
-         x: serverPlayerData.x,
-         y: serverPlayerData.y,
-         isDead: serverPlayerData.isDead,
-         // Include other critical state if needed (e.g., HP for UI)
-         hp: serverPlayerData.hp,
-         maxHp: serverPlayerData.maxHp,
-         xp: serverPlayerData.xp,
-         level: serverPlayerData.level,
-         canChooseLevel2: serverPlayerData.canChooseLevel2,
-         lastProcessedInputSeq: serverPlayerData.lastProcessedInputSeq
-     };
+    if (!players.has(selfId)) {
+        // Initialize player state storage if it doesn't exist yet
+        players.set(selfId, { data: {}, interpBuffer: [], renderX: 0, renderY: 0 });
+    }
+    const playerState = players.get(selfId);
+    playerState.data = serverPlayerData; // Store the latest authoritative data
 
-     // Store the authoritative state (used for UI, maybe minor corrections)
-      if (!players.has(selfId)) players.set(selfId, { data: {}, renderX: 0, renderY: 0 });
-      players.get(selfId).data = serverPlayerData; // Keep full data for UI etc.
+    // --- Client-Side Prediction Reconciliation ---
+    predictedState.isDead = serverPlayerData.isDead; // Server dictates life/death
 
-     // --- Client-Side Prediction Reconciliation ---
-     predictedState.isDead = serverState.isDead; // Server is authoritative for death
+    // Remove acknowledged inputs from history
+    const lastProcessedSeq = serverPlayerData.lastProcessedInputSeq || 0;
+    inputHistory = inputHistory.filter(hist => hist.seq > lastProcessedSeq);
 
-     // Remove acknowledged inputs from history
-     inputHistory = inputHistory.filter(hist => hist.seq > serverState.lastProcessedInputSeq);
+    // Server's authoritative position
+    const serverX = serverPlayerData.x;
+    const serverY = serverPlayerData.y;
 
-      // Check for significant position difference (server correction)
-      const diffX = serverState.x - predictedState.x;
-      const diffY = serverState.y - predictedState.y;
-      const errorDistance = Math.sqrt(diffX * diffX + diffY * diffY);
+    // Calculate prediction error
+    const errorX = serverX - predictedState.x;
+    const errorY = serverY - predictedState.y;
+    const errorDist = Math.sqrt(errorX * errorX + errorY * errorY);
 
-     // If error is large, snap to server position. Otherwise, allow prediction.
-     // Threshold needs tuning - too small = jittery, too large = prediction errors visible
-     const CORRECTION_THRESHOLD = PLAYER_SPEED * (BASE_TICK_RATE / 10) ; // Allow ~1/10 sec prediction divergence
+    // Correction Threshold - Allow prediction error up to roughly 1 tick's movement
+    // Use latest known speed for threshold calculation
+    const currentSpeed = getPlayerCurrentSpeed(serverPlayerData); // Get speed from server data
+    const correctionThreshold = (currentSpeed * (1000 / BASE_TICK_RATE)) * 1.5; // Allow 1.5 ticks of drift
 
-      if (errorDistance > CORRECTION_THRESHOLD) {
-          console.warn(`Significant prediction error detected! Dist: ${errorDistance.toFixed(1)}. Snapping to server state.`);
-          predictedState.x = serverState.x;
-          predictedState.y = serverState.y;
-      } else if (errorDistance > 1.0) { // Minor corrections - smoothly adjust
-           // predictedState.x = lerp(predictedState.x, serverState.x, 0.1);
-           // predictedState.y = lerp(predictedState.y, serverState.y, 0.1);
-           // Or just let prediction continue and it should converge if inputs match
-      }
+    if (errorDist > correctionThreshold) {
+        // Large error: Snap predicted state directly to server state
+        // console.warn(`Prediction error large (${errorDist.toFixed(1)} > ${correctionThreshold.toFixed(1)}). Snapping.`);
+        predictedState.x = serverX;
+        predictedState.y = serverY;
+        // Clear history on large snap? Maybe not, replay should still fix it.
+        // inputHistory = [];
+    } else if (errorDist > 0.1) {
+         // Minor error: Gently nudge predicted state towards server state
+         // This helps correct small drifts without visible snapping
+         predictedState.x = lerp(predictedState.x, serverX, 0.2); // Adjust interpolation factor (0.2 = 20% correction)
+         predictedState.y = lerp(predictedState.y, serverY, 0.2);
+    }
+    // Else: Error is negligible, prediction is likely accurate.
 
+    // Re-apply unacknowledged inputs onto the corrected predicted state
+    let replayX = predictedState.x;
+    let replayY = predictedState.y;
+    const speedPerTick = currentSpeed * (1000 / BASE_TICK_RATE);
+    const radius = serverPlayerData.radius || 15;
 
-      // Re-apply unacknowledged inputs onto the (potentially corrected) state
-       let replayedX = predictedState.x; // Start replaying from potentially corrected pos
-       let replayedY = predictedState.y;
-       const selfData = players.get(selfId)?.data;
-       const playerSpeed = selfData ? getPlayerCurrentSpeed(selfData) : PLAYER_SPEED; // Get actual speed if possible
-       const speedPerTick = playerSpeed * (1000 / BASE_TICK_RATE); // Speed per assumed server tick
+    inputHistory.forEach(hist => {
+        let moveX = 0, moveY = 0;
+        if (hist.input.up) moveY -= 1; if (hist.input.down) moveY += 1;
+        if (hist.input.left) moveX -= 1; if (hist.input.right) moveX += 1;
+        const magnitude = Math.sqrt(moveX * moveX + moveY * moveY);
+        if (magnitude > 0) {
+             // Apply movement scaled by approximated tick duration (GAME_LOOP_RATE is client fps, use BASE_TICK_RATE based)
+            const moveAmount = speedPerTick * (1 / BASE_TICK_RATE);
+            replayX += (moveX / magnitude) * moveAmount;
+            replayY += (moveY / magnitude) * moveAmount;
+             // Clamp during replay
+             replayX = Math.max(radius, Math.min(mapWidth - radius, replayX));
+             replayY = Math.max(radius, Math.min(mapHeight - radius, replayY));
+        }
+    });
 
-       inputHistory.forEach(hist => {
-            let moveX = 0;
-            let moveY = 0;
-            if (hist.input.up) moveY -= 1;
-            if (hist.input.down) moveY += 1;
-            if (hist.input.left) moveX -= 1;
-            if (hist.input.right) moveX += 1;
-            const magnitude = Math.sqrt(moveX * moveX + moveY * moveY);
-            if (magnitude > 0) {
-                replayedX += (moveX / magnitude) * speedPerTick * (GAME_LOOP_RATE / 1000.0); // Apply scaled movement for this past input frame
-                 replayedY += (moveY / magnitude) * speedPerTick * (GAME_LOOP_RATE / 1000.0);
-                 // Clamp to map boundaries during replay
-                 replayedX = Math.max(selfData.radius, Math.min(mapWidth - selfData.radius, replayedX));
-                 replayedY = Math.max(selfData.radius, Math.min(mapHeight - selfData.radius, replayedY));
-            }
-       });
-
-      // The result of the replay is our new predicted state
-      predictedState.x = replayedX;
-      predictedState.y = replayedY;
+    // Update the final predicted state after replay
+    predictedState.x = replayX;
+    predictedState.y = replayY;
+    predictedState.radius = radius; // Keep radius updated
 }
 
-
 function handleOtherPlayerState(playerData, serverTime) {
-    const renderTime = Date.now() - INTERPOLATION_DELAY; // Target time to render
+    const renderTime = Date.now() - INTERPOLATION_DELAY; // Target time
 
     if (!players.has(playerData.id)) {
         // New player seen
         players.set(playerData.id, {
-            data: playerData,
+            data: playerData, // Store initial data
             interpBuffer: [{ timestamp: serverTime, x: playerData.x, y: playerData.y }],
-            renderX: playerData.x, // Start rendering at initial position
+            renderX: playerData.x, // Start rendering here
             renderY: playerData.y
         });
-         console.log(`New player ${playerData.name} (${playerData.id}) detected.`);
     } else {
-        // Existing player - add state to buffer
+        // Existing player
         const playerState = players.get(playerData.id);
-        playerState.data = playerData; // Update latest data (for UI, etc.)
+        playerState.data = playerData; // Update latest server data
 
-        // Add to interpolation buffer, keeping it sorted by time
-        playerState.interpBuffer.push({ timestamp: serverTime, x: playerData.x, y: playerData.y });
-
-        // Remove old states from buffer (older than needed for interpolation)
-        while (playerState.interpBuffer.length > 2 && playerState.interpBuffer[1].timestamp < renderTime) {
-            playerState.interpBuffer.shift();
+        // Add to interpolation buffer only if position changed significantly? No, always add for time.
+        const buffer = playerState.interpBuffer;
+        // Prevent buffer bloat if server sends updates very rapidly with no movement
+        if (buffer.length === 0 || buffer[buffer.length - 1].timestamp < serverTime) {
+             buffer.push({ timestamp: serverTime, x: playerData.x, y: playerData.y });
         }
-         // console.log(`Player ${playerData.id} buffer size: ${playerState.interpBuffer.length}`);
+
+
+        // Remove old states (older than needed for interpolation)
+        // Keep at least 2 entries for interpolation
+        while (buffer.length > 2 && buffer[1].timestamp < renderTime - 500) { // Keep ~500ms buffer margin
+            buffer.shift();
+        }
+    }
+}
+
+// --- Input Sending ---
+
+function startInputInterval() {
+    if (inputIntervalId) clearInterval(inputIntervalId); // Clear previous interval if any
+    inputIntervalId = setInterval(sendInputToServer, 1000 / 30); // Send ~30 times/sec
+    console.log("Input sending interval started.");
+}
+
+function stopInputInterval() {
+    if (inputIntervalId) {
+        clearInterval(inputIntervalId);
+        inputIntervalId = null;
+        console.log("Input sending interval stopped.");
     }
 }
 
 function sendInputToServer() {
-    // Add check: Only send if game loop is running and we have selfId
-    if (!isGameLoopRunning || !ws || ws.readyState !== WebSocket.OPEN || !selfId || predictedState.isDead) {
+    // Guard conditions: Must have connection, ID, and player must not be dead
+    if (!ws || ws.readyState !== WebSocket.OPEN || !selfId || predictedState.isDead) {
+        // If dead, ensure movement keys are off
         if (predictedState.isDead) {
-            inputState = { up: false, down: false, left: false, right: false, attack: false, mouseX: 0, mouseY: 0 };
+             inputState.up = inputState.down = inputState.left = inputState.right = inputState.attack = false;
         }
         return;
     }
 
-    // Determine aiming coordinates (World Space)
+    // Calculate Aiming Coordinates (World Space)
     let aimX, aimY;
     if (isTouchDevice && joystickActive) {
-        aimX = predictedState.x + aimFromJoystick.x * 100;
-        aimY = predictedState.y + aimFromJoystick.y * 100;
+        // Aim based on normalized joystick direction
+        // Aim slightly ahead in that direction
+        aimX = predictedState.x + aimFromJoystick.x * 150; // Scale multiplier for aim "distance"
+        aimY = predictedState.y + aimFromJoystick.y * 150;
     } else {
-        // Use camera's *target* position for more responsive aiming with smoothed camera
-        aimX = camera.targetX + (mouseScreenX - canvasHalfWidth);
-        aimY = camera.targetY + (mouseScreenY - canvasHalfHeight);
+        // Aim based on mouse position relative to camera center
+        aimX = camera.x + (mouseScreenX - canvas.width / 2);
+        aimY = camera.y + (mouseScreenY - canvas.height / 2);
     }
 
     inputSequenceNumber++;
     const currentInput = {
-        ...inputState,
+        ...inputState, // up, down, left, right, attack
         mouseX: aimX,
         mouseY: aimY,
         seq: inputSequenceNumber
     };
 
-    // Store for prediction reconciliation
-    inputHistory.push({ seq: inputSequenceNumber, input: { ...currentInput } }); // Store a copy
-    // Keep history buffer reasonably sized
-    if (inputHistory.length > 60) { // Keep ~2 seconds of history (at 30 inputs/sec)
+    // Store copy for prediction history
+    inputHistory.push({ seq: inputSequenceNumber, input: { ...currentInput } });
+    if (inputHistory.length > 120) { // Limit history size (e.g., ~4 seconds at 30Hz)
         inputHistory.shift();
     }
 
+    // Send to server
     ws.send(JSON.stringify({ type: 'input', input: currentInput }));
+
+    // Reset attack state after sending (for click-based attack)
     inputState.attack = false;
 }
 
 // =============================================================================
-// INPUT HANDLING (Keyboard, Mouse, Touch)
+// INPUT HANDLING (Keyboard, Mouse, Touch) - Minimal changes here
 // =============================================================================
 
-function setupInputListeners() {
+function setupInputListeners() { /* ... (Keep previous setupInputListeners code) ... */
     // Keyboard
     window.addEventListener('keydown', (e) => {
         if (level2SelectionScreen.style.display !== 'none' || e.repeat) return; // Ignore input during selection or key repeats
@@ -520,13 +533,11 @@ function setupInputListeners() {
         if (e.button === 0) inputState.attack = true; // Left click
         e.preventDefault(); // Prevent text selection etc.
     });
-    canvas.addEventListener('mouseup', (e) => {
-         // if (e.button === 0) inputState.attack = false; // Reset on mouse up if needed
-    });
+    // Removed mouseup attack reset - handled after sendInput
     canvas.addEventListener('contextmenu', (e) => e.preventDefault()); // Prevent right-click menu
 }
 
-function setupTouchControls() {
+function setupTouchControls() { /* ... (Keep previous setupTouchControls code) ... */
     joystickArea.addEventListener('touchstart', handleJoystickStart, { passive: false });
     joystickArea.addEventListener('touchmove', handleJoystickMove, { passive: false });
     joystickArea.addEventListener('touchend', handleJoystickEnd, { passive: false });
@@ -537,16 +548,12 @@ function setupTouchControls() {
          if (level2SelectionScreen.style.display !== 'none') return;
          inputState.attack = true;
      }, { passive: false });
-     attackButton.addEventListener('touchend', (e) => {
-          e.preventDefault();
-          // inputState.attack = false; // Attack resets after sendInput
-     }, { passive: false });
+     // Removed touchend attack reset
 }
 
-// --- Joystick Logic ---
-function handleJoystickStart(e) {
+function handleJoystickStart(e) { /* ... (Keep previous handleJoystickStart code) ... */
     e.preventDefault();
-    if (level2SelectionScreen.style.display !== 'none' || e.touches.length > 1) return; // Ignore if choosing class or multi-touch on joystick
+    if (level2SelectionScreen.style.display !== 'none' || e.touches.length > 1) return;
 
     const touch = e.changedTouches[0];
     if (!touch) return;
@@ -554,20 +561,19 @@ function handleJoystickStart(e) {
     joystickActive = true;
     touchIdentifier = touch.identifier;
     const rect = joystickArea.getBoundingClientRect();
-    joystickStartX = rect.left + joystickRadius; // Center X
-    joystickStartY = rect.top + joystickRadius;  // Center Y
+    joystickStartX = rect.left + joystickRadius;
+    joystickStartY = rect.top + joystickRadius;
     joystickCurrentX = touch.clientX;
     joystickCurrentY = touch.clientY;
     updateJoystickVisuals();
-    updateInputFromJoystick(); // Update input state immediately
+    updateInputFromJoystick();
 }
 
-function handleJoystickMove(e) {
+function handleJoystickMove(e) { /* ... (Keep previous handleJoystickMove code) ... */
     e.preventDefault();
     if (!joystickActive || level2SelectionScreen.style.display !== 'none') return;
-
     const touch = Array.from(e.changedTouches).find(t => t.identifier === touchIdentifier);
-    if (!touch) return; // Not our tracked touch
+    if (!touch) return;
 
     joystickCurrentX = touch.clientX;
     joystickCurrentY = touch.clientY;
@@ -575,141 +581,105 @@ function handleJoystickMove(e) {
     updateInputFromJoystick();
 }
 
-function handleJoystickEnd(e) {
+function handleJoystickEnd(e) { /* ... (Keep previous handleJoystickEnd code) ... */
     e.preventDefault();
     const touch = Array.from(e.changedTouches).find(t => t.identifier === touchIdentifier);
-    if (!touch) return; // Not our tracked touch ending
+    if (!touch) return;
 
     resetJoystick();
 }
 
-function updateJoystickVisuals() {
+function updateJoystickVisuals() { /* ... (Keep previous updateJoystickVisuals code) ... */
     let dx = joystickCurrentX - joystickStartX;
     let dy = joystickCurrentY - joystickStartY;
     const distance = Math.sqrt(dx * dx + dy * dy);
-
-    let thumbX = dx;
-    let thumbY = dy;
-
+    let thumbX = dx; let thumbY = dy;
     if (distance > maxJoystickDist) {
         const scale = maxJoystickDist / distance;
-        thumbX = dx * scale;
-        thumbY = dy * scale;
+        thumbX = dx * scale; thumbY = dy * scale;
     }
-
-    // Position thumb relative to joystick center
     joystickThumb.style.transform = `translate(${thumbX}px, ${thumbY}px)`;
 }
 
-function updateInputFromJoystick() {
+function updateInputFromJoystick() { /* ... (Keep previous updateInputFromJoystick code, ensuring aimFromJoystick is updated) ... */
     let dx = joystickCurrentX - joystickStartX;
     let dy = joystickCurrentY - joystickStartY;
     const distance = Math.sqrt(dx * dx + dy * dy);
-    const normalizedDist = Math.min(1, distance / maxJoystickDist); // 0 to 1
+    const normalizedDist = Math.min(1, distance / maxJoystickDist);
 
     if (normalizedDist < JOYSTICK_DEAD_ZONE) {
-        // Inside dead zone - stop movement, keep last aim direction?
-        inputState.up = false;
-        inputState.down = false;
-        inputState.left = false;
-        inputState.right = false;
-        // Don't reset aimFromJoystick here, keep last direction
+        inputState.up = inputState.down = inputState.left = inputState.right = false;
+        // Keep aimFromJoystick as it was for aiming while stopped
         return;
     }
 
-    // Normalize the direction vector outside the dead zone
     const angle = Math.atan2(dy, dx);
     const effectiveDx = Math.cos(angle);
     const effectiveDy = Math.sin(angle);
 
-     // Store normalized aim direction
-     aimFromJoystick.x = effectiveDx;
-     aimFromJoystick.y = effectiveDy;
+    // Update aim direction
+    aimFromJoystick.x = effectiveDx;
+    aimFromJoystick.y = effectiveDy;
 
-    // Determine movement based on angle (more precise zones)
+    // Update movement state
     const pi = Math.PI;
     inputState.up = angle > -pi * 0.875 && angle < -pi * 0.125;
     inputState.down = angle > pi * 0.125 && angle < pi * 0.875;
     inputState.left = angle > pi * 0.625 || angle < -pi * 0.625;
     inputState.right = angle > -pi * 0.375 && angle < pi * 0.375;
-
-     // Diagonal checks (optional, improves diagonal feel)
-     if (Math.abs(effectiveDx) > 0.6 && Math.abs(effectiveDy) > 0.6) {
-          inputState.up = effectiveDy < 0;
-          inputState.down = effectiveDy > 0;
-          inputState.left = effectiveDx < 0;
-          inputState.right = effectiveDx > 0;
-     }
+     // Optional diagonal refinement
+     // if (Math.abs(effectiveDx) > 0.6 && Math.abs(effectiveDy) > 0.6) { ... }
 }
 
-function resetJoystick() {
+function resetJoystick() { /* ... (Keep previous resetJoystick code) ... */
     joystickActive = false;
     touchIdentifier = null;
-    joystickThumb.style.transform = `translate(0px, 0px)`; // Reset thumb position
-    inputState.up = false;
-    inputState.down = false;
-    inputState.left = false;
-    inputState.right = false;
-    // Don't reset aimFromJoystick, player might want to shoot in last direction
+    joystickThumb.style.transform = `translate(0px, 0px)`;
+    inputState.up = inputState.down = inputState.left = inputState.right = false;
+    // Do NOT reset aimFromJoystick here
 }
 
 // =============================================================================
-// LEVEL 2 SELECTION
+// LEVEL 2 SELECTION UI - Minimal changes
 // =============================================================================
-
-function showLevel2Selection() {
-    const player = players.get(selfId)?.data; // Get latest data
+function showLevel2Selection() { /* ... (Keep previous showLevel2Selection code) ... */
+    const player = players.get(selfId)?.data;
     if (!player) return;
-
-    level2OptionsDiv.innerHTML = ''; // Clear previous
-
+    level2OptionsDiv.innerHTML = '';
     let choices = [];
-    // Determine choices based on race (MUST match server logic)
-     switch (player.race) {
-         case 'human': case 'elf': case 'gnome':
-             choices = [{ id: 'warrior', name: 'Warrior', desc: '+HP, Melee Dmg' }, { id: 'mage', name: 'Mage', desc: 'Ranged Attack' }]; break;
-         case 'vampire':
-             choices = [{ id: 'lord', name: 'Lord Vampire', desc: 'High Lifesteal, +HP' }, { id: 'higher', name: 'Higher Vampire', desc: '+Speed, +Atk Speed' }]; break;
-         case 'goblin':
-             choices = [{ id: 'king', name: 'Goblin King', desc: '++HP, Okay Dmg' }, { id: 'hobgoblin', name: 'Hobgoblin', desc: '+HP, High Melee Dmg, -Speed' }]; break;
+     switch (player.race) { /* ... race logic ... */
+         case 'human': case 'elf': case 'gnome': choices = [{ id: 'warrior', name: 'Warrior', desc: '+HP, Melee Dmg' }, { id: 'mage', name: 'Mage', desc: 'Ranged Attack' }]; break;
+         case 'vampire': choices = [{ id: 'lord', name: 'Lord Vampire', desc: 'High Lifesteal, +HP' }, { id: 'higher', name: 'Higher Vampire', desc: '+Speed, +Atk Speed' }]; break;
+         case 'goblin': choices = [{ id: 'king', name: 'Goblin King', desc: '++HP, Okay Dmg' }, { id: 'hobgoblin', name: 'Hobgoblin', desc: '+HP, High Melee Dmg, -Speed' }]; break;
      }
-
     choices.forEach(choice => {
         const button = document.createElement('button');
         button.textContent = `${choice.name} (${choice.desc})`;
         button.onclick = () => {
             if (ws && ws.readyState === WebSocket.OPEN) {
                 ws.send(JSON.stringify({ type: 'selectClass', choice: choice.id }));
-                // Hide immediately for responsiveness, server confirms later
-                level2SelectionScreen.style.display = 'none';
+                level2SelectionScreen.style.display = 'none'; // Hide optimistically
             }
         };
         level2OptionsDiv.appendChild(button);
     });
-
     level2SelectionScreen.style.display = 'block';
 }
 
 // =============================================================================
-// CLIENT-SIDE MOVEMENT (PREDICTION)
+// CLIENT-SIDE MOVEMENT PREDICTION - Minimal changes
 // =============================================================================
-
 function updateSelfPlayerPrediction(deltaTime) {
-    if (!selfId || predictedState.isDead) return;
+    if (!selfId || predictedState.isDead) return; // Don't predict if dead
 
-    const selfData = players.get(selfId)?.data; // Get latest authoritative data if available
-    const radius = selfData?.radius || 15; // Use default if data missing
-    // Determine current speed based on latest data or base speed
-     const playerSpeed = selfData ? getPlayerCurrentSpeed(selfData) : PLAYER_SPEED;
-     const speedPerSecond = playerSpeed * BASE_TICK_RATE; // Speed units per second
+    const selfData = players.get(selfId)?.data; // Use latest data for speed/radius if available
+    const radius = selfData?.radius || predictedState.radius || 15;
+    const currentSpeed = selfData ? getPlayerCurrentSpeed(selfData) : PLAYER_BASE_SPEED;
+    const speedPerSecond = currentSpeed * BASE_TICK_RATE; // Base speed units per second
 
-
-    let moveX = 0;
-    let moveY = 0;
-    if (inputState.up) moveY -= 1;
-    if (inputState.down) moveY += 1;
-    if (inputState.left) moveX -= 1;
-    if (inputState.right) moveX += 1;
+    let moveX = 0, moveY = 0;
+    if (inputState.up) moveY -= 1; if (inputState.down) moveY += 1;
+    if (inputState.left) moveX -= 1; if (inputState.right) moveX += 1;
 
     const magnitude = Math.sqrt(moveX * moveX + moveY * moveY);
     if (magnitude > 0) {
@@ -717,46 +687,33 @@ function updateSelfPlayerPrediction(deltaTime) {
         const dy = (moveY / magnitude) * speedPerSecond * deltaTime;
         predictedState.x += dx;
         predictedState.y += dy;
+        // Clamp predicted position immediately
+        predictedState.x = Math.max(radius, Math.min(mapWidth - radius, predictedState.x));
+        predictedState.y = Math.max(radius, Math.min(mapHeight - radius, predictedState.y));
     }
-
-    // Clamp predicted position to map boundaries
-    predictedState.x = Math.max(radius, Math.min(mapWidth - radius, predictedState.x));
-    predictedState.y = Math.max(radius, Math.min(mapHeight - radius, predictedState.y));
 }
 
-// Helper to get current speed based on player data (race, class etc)
-// THIS IS A SIMPLIFIED GUESS - Server holds the true speed value
-// Ideally, server would send the speed stat in player data
+// Helper to get current speed based on player data (ESTIMATE - Server is authoritative)
 function getPlayerCurrentSpeed(playerData) {
-     // Rough estimate based on class/race, MUST be kept in sync with server logic for accurate prediction
-     let baseSpeed = PLAYER_SPEED;
-     // Apply race modifiers
-     if (playerData.race === 'elf') baseSpeed *= 1.1;
-     if (playerData.race === 'goblin') baseSpeed *= 1.05;
-
-     // Apply class/mutation modifiers
-     if (playerData.classOrMutation === 'higher') baseSpeed *= 1.2;
-     if (playerData.classOrMutation === 'hobgoblin') baseSpeed *= 0.85;
-
-     return baseSpeed;
+    if (!playerData) return PLAYER_BASE_SPEED;
+    let baseSpeed = PLAYER_BASE_SPEED;
+    // Apply race modifiers (MUST match server logic)
+    if (playerData.race === 'elf') baseSpeed *= 1.1;
+    if (playerData.race === 'goblin') baseSpeed *= 1.05;
+    // Apply class/mutation modifiers (MUST match server logic)
+    if (playerData.classOrMutation === 'higher') baseSpeed *= 1.2;
+    if (playerData.classOrMutation === 'hobgoblin') baseSpeed *= 0.85;
+    return baseSpeed;
 }
 
 
 // =============================================================================
-// GAME LOOP & RENDERING
+// GAME LOOP & RENDERING (Optimization Focus)
 // =============================================================================
 
 function startGameLoop() {
-    if (isGameLoopRunning) {
-        console.warn("Game loop start requested, but already running.");
-        return;
-    }
-    if (!selfId) {
-         console.error("Cannot start game loop: selfId not set.");
-         return;
-    }
-    console.log("Starting game loop...");
-    isGameLoopRunning = true;
+    if (gameLoopId) return; // Already running
+    console.log("Starting Game Loop...");
     lastFrameTime = performance.now();
     gameLoopId = requestAnimationFrame(gameLoop);
 }
@@ -765,201 +722,177 @@ function stopGameLoop() {
     if (gameLoopId) {
         cancelAnimationFrame(gameLoopId);
         gameLoopId = null;
+        console.log("Game Loop Stopped.");
     }
-    // Important: Set flag to false *after* cancelling frame
-    isGameLoopRunning = false;
-    console.log("Game loop stopped.");
-}
-
-// Reset client state completely to return to start screen cleanly
-function resetClientState() {
-     stopGameLoop(); // Ensure loop is stopped
-     selfId = null;
-     players.clear();
-     orbs = [];
-     projectiles = [];
-     inputHistory = [];
-     inputSequenceNumber = 0;
-     predictedState = { x: -1000, y: -1000, isDead: true, radius: PLAYER_RADIUS };
-     camera = { x: -1000, y: -1000, targetX: -1000, targetY: -1000, speed: 0.1 };
-     level2SelectionScreen.style.display = 'none';
-     touchControls.style.display = 'none';
-     canvas.style.display = 'none';
-     startScreen.style.display = 'block'; // Show start screen
 }
 
 function gameLoop(currentTime) {
-    // Primary safeguard: If loop somehow runs before ready, exit.
-    if (!isGameLoopRunning || !selfId || !players.has(selfId)) {
-         console.warn("Game loop running prematurely, skipping frame.");
-         // Request next frame ONLY if the flag indicates it should be running
-         if (isGameLoopRunning) {
-              gameLoopId = requestAnimationFrame(gameLoop);
-         }
-         return;
+    if (!selfId) { // Ensure we have player ID before running game logic
+        gameLoopId = requestAnimationFrame(gameLoop); // Keep requesting frame until ready
+        return;
     }
 
-    const deltaTime = Math.min(0.05, (currentTime - lastFrameTime) / 1000.0); // Cap delta time at 50ms (20fps min)
+    const deltaTime = Math.min(0.05, (currentTime - lastFrameTime) / 1000.0); // Delta time in seconds, capped
     lastFrameTime = currentTime;
 
-    // --- Update ---
-    updateSelfPlayerPrediction(deltaTime);
-    updateCamera(deltaTime); // Uses PREDICTED state now
-    updateOtherPlayerInterpolation(currentTime);
+    // --- Updates ---
+    updateSelfPlayerPrediction(deltaTime); // Predict own movement
+    updateCamera(deltaTime); // Smooth camera update
+    updateOtherPlayerInterpolation(currentTime); // Calculate render positions for others
 
     // --- Rendering ---
-    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    ctx.clearRect(0, 0, canvas.width, canvas.height); // Clear canvas
 
-    // Apply camera transform (using smoothed camera position)
-    ctx.save();
-    ctx.translate(canvasHalfWidth - camera.x, canvasHalfHeight - camera.y);
-
-    // Get current view bounds based on SMOOTHED camera
+    // Calculate visible bounds ONCE per frame
     const viewBounds = getCameraViewBounds();
 
-    // Draw world elements with culling
-    drawMapBackground(viewBounds); // Pass bounds for optimization
-    drawOrbs(orbs, viewBounds);
-    drawProjectiles(projectiles, viewBounds);
-    drawPlayers(viewBounds); // Pass bounds for culling
+    // --- World Rendering (relative to camera) ---
+    ctx.save();
+    ctx.translate(canvas.width / 2 - camera.x, canvas.height / 2 - camera.y);
 
-    ctx.restore();
+    drawMapBackground(viewBounds); // Pass bounds for culling
+    drawOrbs(viewBounds);
+    drawProjectiles(viewBounds);
+    drawPlayers(viewBounds);
 
-    // Draw UI elements (fixed on screen)
-    drawUI();
+    ctx.restore(); // Remove camera transform
 
-    // Draw Level 2 Selection Overlay if active
-    if (level2SelectionScreen.style.display !== 'none') {
-        ctx.fillStyle = 'rgba(0, 0, 0, 0.6)'; // Darken background
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-    }
+    // --- UI Rendering (fixed on screen) ---
+    drawUI(); // Draw HUD elements
 
-    // Request next frame (only if loop should continue)
-    if (isGameLoopRunning) {
-        gameLoopId = requestAnimationFrame(gameLoop);
-    }
+     // Optional: Darken if level up screen is visible
+     if(level2SelectionScreen.style.display !== 'none') {
+         ctx.fillStyle = 'rgba(0,0,0,0.5)';
+         ctx.fillRect(0,0,canvas.width, canvas.height);
+     }
+
+    // Request next frame
+    gameLoopId = requestAnimationFrame(gameLoop);
 }
 
 function updateCamera(deltaTime) {
-     // Camera smoothly follows the *predicted* player position
-     // Ensure predictedState exists and has valid coords
-     if (typeof predictedState.x === 'number' && typeof predictedState.y === 'number') {
-          camera.targetX = predictedState.x;
-          camera.targetY = predictedState.y;
+    // Camera smoothly follows the predicted player position
+    // Ensure target exists (player might not be in map yet briefly)
+    if (predictedState && !isNaN(predictedState.x) && !isNaN(predictedState.y)) {
+        camera.targetX = predictedState.x;
+        camera.targetY = predictedState.y;
+    }
 
-          // Use lerp for smooth camera following
-          camera.x = lerp(camera.x, camera.targetX, camera.speed);
-          camera.y = lerp(camera.y, camera.targetY, camera.speed);
+    // Use lerp for smooth camera following - adjust speed (0.15 here) for desired smoothness
+    camera.x = lerp(camera.x, camera.targetX, camera.speed);
+    camera.y = lerp(camera.y, camera.targetY, camera.speed);
 
-          // Snap close to target to prevent drifting
-          if (Math.abs(camera.x - camera.targetX) < 0.5) camera.x = camera.targetX;
-          if (Math.abs(camera.y - camera.targetY) < 0.5) camera.y = camera.targetY;
-     }
+    // Minor optimization: Snap to target if very close to prevent sub-pixel jitter
+    if (Math.abs(camera.x - camera.targetX) < 0.1) camera.x = camera.targetX;
+    if (Math.abs(camera.y - camera.targetY) < 0.1) camera.y = camera.targetY;
 }
 
 function updateOtherPlayerInterpolation(currentTime) {
-     const renderTime = currentTime - INTERPOLATION_DELAY;
+    const renderTime = currentTime - INTERPOLATION_DELAY;
 
-     players.forEach((playerState, id) => {
-         if (id === selfId) return; // Skip self
+    players.forEach((playerState, id) => {
+        if (id === selfId) return; // Skip self
 
-         const buffer = playerState.interpBuffer;
-         if (buffer.length < 2) {
-              // Not enough data to interpolate, just use latest known position
-              if (buffer.length === 1) {
-                   playerState.renderX = buffer[0].x;
-                   playerState.renderY = buffer[0].y;
-              } else if (playerState.data) { // Fallback to last data received
-                   playerState.renderX = playerState.data.x;
-                   playerState.renderY = playerState.data.y;
-              }
-             return;
-         }
+        const buffer = playerState.interpBuffer;
+        if (buffer.length < 2) { // Need at least two points to interpolate
+            if (buffer.length === 1) { // Fallback: Use the single point available
+                playerState.renderX = buffer[0].x;
+                playerState.renderY = buffer[0].y;
+            } else if (playerState.data) { // Further fallback: Use latest data if buffer empty
+                 playerState.renderX = playerState.data.x;
+                 playerState.renderY = playerState.data.y;
+            }
+            return;
+        }
 
-         // Find two buffer entries surrounding the renderTime
-         let state1 = null;
-         let state2 = null;
-         for (let i = buffer.length - 1; i >= 0; i--) {
-             if (buffer[i].timestamp <= renderTime) {
-                 state1 = buffer[i];
-                 state2 = buffer[i + 1] || state1; // Use next state or duplicate if at end
-                 break;
+        // Find buffer entries surrounding the target render time
+        let state1 = buffer[0];
+        let state2 = buffer[1];
+        for (let i = 1; i < buffer.length; i++) {
+            if (buffer[i].timestamp >= renderTime) {
+                state2 = buffer[i];
+                state1 = buffer[i - 1];
+                break;
+            }
+             // If renderTime is past the last entry, extrapolate (or clamp)
+             if (i === buffer.length - 1) {
+                 state1 = buffer[i - 1];
+                 state2 = buffer[i]; // Use last two points
              }
-         }
-
-          if (!state1) { // Render time is before the oldest state in buffer, extrapolate? Or clamp.
-              state1 = buffer[0];
-              state2 = buffer[1] || state1;
-              // console.warn(`Render time (${renderTime.toFixed(0)}) is before oldest state for player ${id}. Clamping.`);
-          }
-
-
-         // Calculate interpolation factor (alpha)
-         const timeDiff = state2.timestamp - state1.timestamp;
-         const alpha = timeDiff > 0 ? Math.max(0, Math.min(1, (renderTime - state1.timestamp) / timeDiff)) : 1;
-
-         // Interpolate position
-         playerState.renderX = lerp(state1.x, state2.x, alpha);
-         playerState.renderY = lerp(state1.y, state2.y, alpha);
-
-         // Debug: Log interpolation results occasionally
-         // if (Math.random() < 0.01) {
-         //     console.log(`Interpolating ${id}: t1=${state1.timestamp}, t2=${state2.timestamp}, renderT=${renderTime.toFixed(0)}, alpha=${alpha.toFixed(2)} -> (${playerState.renderX.toFixed(1)}, ${playerState.renderY.toFixed(1)})`);
-         // }
-     });
- }
-
-
-// --- Drawing Functions ---
-
-function drawMapBackground(viewBounds) { // Receive viewBounds
-    // Simple boundary box (always draw if map is small relative to view?)
-    ctx.strokeStyle = '#555';
-    ctx.lineWidth = 5;
-    ctx.strokeRect(0, 0, mapWidth, mapHeight);
-
-    // Optimized grid drawing
-    const gridSize = 100;
-    ctx.strokeStyle = '#444';
-    ctx.lineWidth = 1;
-    // Calculate start/end based on viewBounds
-    const startX = Math.floor(viewBounds.left / gridSize) * gridSize;
-    const endX = Math.ceil(viewBounds.right / gridSize) * gridSize;
-    const startY = Math.floor(viewBounds.top / gridSize) * gridSize;
-    const endY = Math.ceil(viewBounds.bottom / gridSize) * gridSize;
-
-    ctx.beginPath();
-    // Draw only lines that intersect the view
-    for (let x = startX; x <= endX; x += gridSize) {
-        if (x >= 0 && x <= mapWidth) { // Clamp line drawing to map boundaries
-             ctx.moveTo(x, Math.max(0, viewBounds.top));
-             ctx.lineTo(x, Math.min(mapHeight, viewBounds.bottom));
         }
-    }
-    for (let y = startY; y <= endY; y += gridSize) {
-         if (y >= 0 && y <= mapHeight) {
-             ctx.moveTo(Math.max(0, viewBounds.left), y);
-             ctx.lineTo(Math.min(mapWidth, viewBounds.right), y);
-         }
-    }
-    ctx.stroke();
-}
 
-function drawOrbs(orbsToDraw, viewBounds) { // Receive viewBounds
-    ctx.fillStyle = '#f0e370';
-    orbsToDraw.forEach(orb => {
-        // Cull check: Use orb radius as margin
-        if (isPointInBounds(orb.x, orb.y, viewBounds, orb.radius)) {
-            ctx.beginPath();
-            ctx.arc(orb.x, orb.y, orb.radius, 0, Math.PI * 2);
-            ctx.fill();
-        }
+        // Calculate interpolation factor (alpha)
+        const timeDiff = state2.timestamp - state1.timestamp;
+        // Prevent division by zero and clamp alpha between 0 and 1
+        const alpha = timeDiff > 0 ? Math.max(0, Math.min(1, (renderTime - state1.timestamp) / timeDiff)) : 1;
+
+        // Interpolate position using lerp
+        playerState.renderX = lerp(state1.x, state2.x, alpha);
+        playerState.renderY = lerp(state1.y, state2.y, alpha);
     });
 }
 
-function drawProjectiles(projectilesToDraw, viewBounds) { // Receive viewBounds
-    projectilesToDraw.forEach(proj => {
-         // Cull check: Use projectile radius
+// --- Drawing Functions (Optimized) ---
+
+const GRID_COLOR = '#444';
+const GRID_LINE_WIDTH = 1;
+const BOUNDARY_COLOR = '#555';
+const BOUNDARY_LINE_WIDTH = 5;
+const GRID_SIZE = 100;
+
+function drawMapBackground(viewBounds) {
+    // Draw Grid (only visible lines)
+    ctx.strokeStyle = GRID_COLOR;
+    ctx.lineWidth = GRID_LINE_WIDTH;
+    ctx.beginPath(); // Batch all grid lines into one path
+
+    const startX = Math.floor(viewBounds.left / GRID_SIZE) * GRID_SIZE;
+    const endX = Math.ceil(viewBounds.right / GRID_SIZE) * GRID_SIZE;
+    const startY = Math.floor(viewBounds.top / GRID_SIZE) * GRID_SIZE;
+    const endY = Math.ceil(viewBounds.bottom / GRID_SIZE) * GRID_SIZE;
+
+    for (let x = startX; x <= endX; x += GRID_SIZE) {
+        ctx.moveTo(x, viewBounds.top - GRID_LINE_WIDTH); // Extend slightly beyond view for seamless scrolling
+        ctx.lineTo(x, viewBounds.bottom + GRID_LINE_WIDTH);
+    }
+    for (let y = startY; y <= endY; y += GRID_SIZE) {
+        ctx.moveTo(viewBounds.left - GRID_LINE_WIDTH, y);
+        ctx.lineTo(viewBounds.right + GRID_LINE_WIDTH, y);
+    }
+    ctx.stroke(); // Draw all lines at once
+
+    // Draw Boundaries (only if visible) - Rendered last to be on top of grid
+    ctx.strokeStyle = BOUNDARY_COLOR;
+    ctx.lineWidth = BOUNDARY_LINE_WIDTH;
+     // Top boundary
+     if (viewBounds.top < 0) ctx.strokeRect(0, 0, mapWidth, 1); // Approximate rect for top line
+     // Bottom boundary
+     if (viewBounds.bottom > mapHeight) ctx.strokeRect(0, mapHeight - 1, mapWidth, 1);
+     // Left boundary
+     if (viewBounds.left < 0) ctx.strokeRect(0, 0, 1, mapHeight);
+     // Right boundary
+     if (viewBounds.right > mapWidth) ctx.strokeRect(mapWidth - 1, 0, 1, mapHeight);
+}
+
+const ORB_COLOR = '#f0e370';
+function drawOrbs(viewBounds) {
+    ctx.fillStyle = ORB_COLOR;
+    ctx.beginPath(); // Batch all orbs into one path if same color
+    let count = 0;
+    orbs.forEach(orb => {
+        // Culling check
+        if (isPointInBounds(orb.x, orb.y, viewBounds, orb.radius)) {
+            ctx.moveTo(orb.x + orb.radius, orb.y); // Move to start point for arc
+            ctx.arc(orb.x, orb.y, orb.radius, 0, Math.PI * 2);
+            count++;
+        }
+    });
+    if (count > 0) ctx.fill(); // Fill all visible orbs at once
+}
+
+function drawProjectiles(viewBounds) {
+    // Projectiles have different colors, cannot batch easily
+    projectiles.forEach(proj => {
         if (isPointInBounds(proj.x, proj.y, viewBounds, proj.radius)) {
             ctx.fillStyle = proj.color || '#ffffff';
             ctx.beginPath();
@@ -969,157 +902,205 @@ function drawProjectiles(projectilesToDraw, viewBounds) { // Receive viewBounds
     });
 }
 
-function drawPlayers(viewBounds) { // Receive viewBounds
+const PLAYER_OUTLINE_COLOR = '#000000';
+const PLAYER_OUTLINE_WIDTH = 2;
+const NAME_FONT = 'bold 12px sans-serif';
+const NAME_COLOR = '#ffffff';
+const TEXT_SHADOW_COLOR = 'black';
+const TEXT_SHADOW_BLUR = 2;
+
+function drawPlayers(viewBounds) {
+    ctx.lineWidth = PLAYER_OUTLINE_WIDTH;
+    ctx.strokeStyle = PLAYER_OUTLINE_COLOR;
+    ctx.font = NAME_FONT;
+    ctx.textAlign = 'center';
+
     players.forEach((playerState, id) => {
         const data = playerState.data;
-        if (!data) return; // Skip if no data yet
+        if (!data || data.isDead) return; // Skip dead or missing data
 
-        let drawX, drawY, radius;
-        let isSelf = (id === selfId);
-
-        if (isSelf) {
-             if (predictedState.isDead) return; // Don't draw self if dead
-             drawX = predictedState.x;
-             drawY = predictedState.y;
-             radius = predictedState.radius; // Use radius from predicted state (updated from server)
+        let drawX, drawY;
+        if (id === selfId) {
+            if (predictedState.isDead) return; // Don't draw self if predicted dead
+            drawX = predictedState.x; drawY = predictedState.y;
         } else {
-             if (data.isDead) return; // Don't draw others if dead
-             drawX = playerState.renderX;
-             drawY = playerState.renderY;
-             radius = data.radius;
-             if (isNaN(drawX) || isNaN(drawY)) { // Fallback if interpolation failed
-                  drawX = data.x; drawY = data.y;
-             }
+            drawX = playerState.renderX; drawY = playerState.renderY;
+            if (isNaN(drawX) || isNaN(drawY)) { // Fallback if interpolation failed
+                 drawX = data.x; drawY = data.y;
+            }
         }
 
-         // Culling: Check if the *center* of the player is within bounds (+radius margin)
-         if (!isPointInBounds(drawX, drawY, viewBounds, radius)) {
-             return; // Skip drawing entirely if center is too far off-screen
-         }
+        // Culling check (include margin for name/hp bar)
+        if (!isPointInBounds(drawX, drawY, viewBounds, data.radius * 4)) return;
 
-         // Draw Player Circle
-         ctx.fillStyle = data.color || '#cccccc';
-         ctx.strokeStyle = '#000000';
-         ctx.lineWidth = 2;
-         ctx.beginPath();
-         ctx.arc(drawX, drawY, radius, 0, Math.PI * 2);
-         ctx.fill();
-         ctx.stroke();
+        // Draw Player Circle
+        ctx.fillStyle = data.color || '#cccccc';
+        ctx.beginPath();
+        ctx.arc(drawX, drawY, data.radius, 0, Math.PI * 2);
+        ctx.fill();
+        ctx.stroke(); // Stroke after fill
 
-         // Draw Name & Level (with text shadow)
-         ctx.fillStyle = '#ffffff';
-         ctx.textAlign = 'center';
-         ctx.font = 'bold 12px sans-serif';
-         ctx.shadowColor = 'black'; ctx.shadowBlur = 3; // Slightly stronger shadow
-         ctx.fillText(`${data.name} [${data.level}]`, drawX, drawY - radius - 15);
-         ctx.shadowBlur = 0; // Reset shadow
+        // Draw Name (with shadow for readability)
+        const nameY = drawY - data.radius - 15;
+        ctx.fillStyle = NAME_COLOR;
+        ctx.shadowColor = TEXT_SHADOW_COLOR;
+        ctx.shadowBlur = TEXT_SHADOW_BLUR;
+        ctx.fillText(`${data.name} [${data.level}]`, drawX, nameY);
+        ctx.shadowBlur = 0; // Reset shadow immediately
 
-         // Draw HP Bar
-         drawHpBar(ctx, drawX, drawY, radius, data.hp, data.maxHp);
+        // Draw HP Bar (call helper function)
+        drawHpBar(ctx, drawX, nameY + 5, data.radius, data.hp, data.maxHp); // Position below name
     });
 }
 
+// Optimized HP Bar drawing function
+const HP_BAR_HEIGHT = 6;
+const HP_BAR_BG_COLOR = '#555';
+const HP_BAR_BORDER_COLOR = '#333';
+const HP_BAR_BORDER_WIDTH = 1;
+const HP_COLOR_HIGH = '#4CAF50'; // Green
+const HP_COLOR_MID = '#ffc107';  // Yellow
+const HP_COLOR_LOW = '#f44336';   // Red
+
 function drawHpBar(context, x, y, ownerRadius, hp, maxHp) {
     const hpBarWidth = ownerRadius * 2.5;
-    const hpBarHeight = 6;
     const hpBarX = x - hpBarWidth / 2;
-    const hpBarY = y - ownerRadius - 10; // Position above name
-    const hpPercent = maxHp > 0 ? Math.max(0, hp / maxHp) : 0;
+    // Y position is passed directly (e.g., below name)
 
-    context.fillStyle = '#555'; // Background
-    context.fillRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
-    context.fillStyle = hpPercent > 0.6 ? '#4CAF50' : (hpPercent > 0.3 ? '#ffc107' : '#f44336'); // Green/Yellow/Red
-    context.fillRect(hpBarX, hpBarY, hpBarWidth * hpPercent, hpBarHeight);
-    context.strokeStyle = '#333';
-    context.lineWidth = 1;
-    context.strokeRect(hpBarX, hpBarY, hpBarWidth, hpBarHeight);
+    // Calculate HP percentage safely
+    const hpPercent = maxHp > 0 ? Math.max(0, hp / maxHp) : 0;
+    const currentHpWidth = hpBarWidth * hpPercent;
+
+    // Draw background
+    context.fillStyle = HP_BAR_BG_COLOR;
+    context.fillRect(hpBarX, y, hpBarWidth, HP_BAR_HEIGHT);
+
+    // Draw current HP portion
+    context.fillStyle = hpPercent > 0.6 ? HP_COLOR_HIGH : (hpPercent > 0.3 ? HP_COLOR_MID : HP_COLOR_LOW);
+    if (currentHpWidth > 0) { // Only draw if HP > 0
+       context.fillRect(hpBarX, y, currentHpWidth, HP_BAR_HEIGHT);
+    }
+
+    // Draw border (optional, but looks better)
+    context.strokeStyle = HP_BAR_BORDER_COLOR;
+    context.lineWidth = HP_BAR_BORDER_WIDTH;
+    context.strokeRect(hpBarX - 0.5, y - 0.5, hpBarWidth + 1, HP_BAR_HEIGHT + 1); // Offset slightly for crisp border
 }
 
+const UI_FONT_LARGE = 'bold 16px sans-serif';
+const UI_FONT_NORMAL = '12px sans-serif';
+const UI_FONT_SMALL = 'bold 12px sans-serif';
+const UI_TEXT_COLOR = '#ffffff';
+const UI_XP_BAR_HEIGHT = 18;
+const UI_XP_COLOR = '#f0e370';
+const UI_BAR_BG_COLOR = 'rgba(85, 85, 85, 0.7)';
+const UI_HP_CIRCLE_X = 80;
+const UI_HP_CIRCLE_Y = canvas.height - 80; // Recalculate if canvas resizes? Yes.
+const UI_HP_CIRCLE_RADIUS = 50;
+const UI_HP_CIRCLE_WIDTH = 8;
 
 function drawUI() {
+    // Get self data ONLY ONCE for UI drawing
     const selfData = players.get(selfId)?.data;
-    if (!selfData) return;
+    // If no self data OR player is dead and we don't want a "You Died" screen yet
+    if (!selfData || selfData.isDead) {
+        // Optionally draw "Respawning..." or "You Died" message
+        if(predictedState.isDead && !level2SelectionScreen.style.display) { // Check predicted state as well
+            ctx.fillStyle = 'rgba(200, 0, 0, 0.7)';
+            ctx.textAlign = 'center';
+            ctx.font = 'bold 30px sans-serif';
+            ctx.fillText('YOU DIED', canvas.width / 2, canvas.height / 2 - 20);
+            ctx.font = 'bold 20px sans-serif';
+            ctx.fillText('Respawning...', canvas.width / 2, canvas.height / 2 + 20);
+        }
+        return; // Don't draw regular UI if dead
+    }
 
-     // Draw XP Bar only if level 1
-     if (selfData.level === 1) {
-          const xpBarWidth = Math.min(400, canvas.width * 0.5);
-          const xpBarHeight = 18;
-          const xpBarX = (canvas.width - xpBarWidth) / 2;
-          const xpBarY = canvas.height - xpBarHeight - 20;
-          const xpProgress = Math.max(0, selfData.xp); // XP is reset on death/level? Assume starts from 0 for level 1
-          const xpNeeded = XP_TO_LEVEL_2;
-          const xpPercent = Math.min(1, xpNeeded > 0 ? xpProgress / xpNeeded : 1);
+    // Common UI styles
+    ctx.textAlign = 'center';
+    ctx.fillStyle = UI_TEXT_COLOR;
+    ctx.shadowColor = TEXT_SHADOW_COLOR;
 
-         // Don't draw if already full (avoids flashing when hitting level 2)
-         if (xpPercent < 1) {
-              ctx.fillStyle = 'rgba(85, 85, 85, 0.7)';
-              ctx.fillRect(xpBarX, xpBarY, xpBarWidth, xpBarHeight);
-              ctx.fillStyle = '#f0e370';
-              ctx.fillRect(xpBarX, xpBarY, xpBarWidth * xpPercent, xpBarHeight);
-              // XP Text
-              ctx.fillStyle = '#ffffff';
-              ctx.textAlign = 'center';
-              ctx.font = 'bold 12px sans-serif';
-              const xpText = `${xpProgress} / ${xpNeeded} XP`;
-              ctx.shadowColor = 'black'; ctx.shadowBlur = 2;
-              ctx.fillText(xpText, canvasHalfWidth, xpBarY + xpBarHeight / 1.5);
-              ctx.shadowBlur = 0;
-         }
-     }
+    // --- XP Bar ---
+    // Only draw if needed (not max level/class chosen)
+    if (selfData.level === 1 && !selfData.canChooseLevel2) {
+        const xpBarWidth = Math.min(400, canvas.width * 0.5);
+        const xpBarX = (canvas.width - xpBarWidth) / 2;
+        const xpBarY = canvas.height - UI_XP_BAR_HEIGHT - 20; // Position from bottom
 
-     // Draw Level (always show)
-     ctx.fillStyle = '#ffffff';
-     ctx.textAlign = 'center';
-     ctx.font = 'bold 16px sans-serif';
-     ctx.shadowColor = 'black'; ctx.shadowBlur = 3;
-     ctx.fillText(`Level: ${selfData.level}`, canvasHalfWidth, canvas.height - 50);
-     ctx.shadowBlur = 0;
+        // Calculate XP progress safely
+        const xpForNextLevel = XP_TO_LEVEL_2; // Assume level 2 is goal
+        const xpCurrentLevelBase = 0;
+        const xpProgress = Math.max(0, selfData.xp - xpCurrentLevelBase);
+        const xpNeeded = xpForNextLevel - xpCurrentLevelBase;
+        const xpPercent = xpNeeded > 0 ? Math.min(1, xpProgress / xpNeeded) : 1;
 
-     // Draw HP Circle (Bottom Left - example)
-     const uiHpX = 80;
-     const uiHpY = canvas.height - 80;
-     const uiHpRadius = 50;
-     const hpPercent = selfData.maxHp > 0 ? Math.max(0, selfData.hp / selfData.maxHp) : 0;
-     const angle = hpPercent * Math.PI * 2;
+        // Draw background
+        ctx.fillStyle = UI_BAR_BG_COLOR;
+        ctx.fillRect(xpBarX, xpBarY, xpBarWidth, UI_XP_BAR_HEIGHT);
+        // Draw progress
+        ctx.fillStyle = UI_XP_COLOR;
+        if (xpPercent > 0) ctx.fillRect(xpBarX, xpBarY, xpBarWidth * xpPercent, UI_XP_BAR_HEIGHT);
+        // Draw text
+        ctx.fillStyle = UI_TEXT_COLOR;
+        ctx.font = UI_FONT_SMALL;
+        ctx.shadowBlur = TEXT_SHADOW_BLUR;
+        ctx.fillText(`${xpProgress} / ${xpNeeded} XP`, canvas.width / 2, xpBarY + UI_XP_BAR_HEIGHT / 1.5);
+        ctx.shadowBlur = 0;
+    }
 
-     ctx.lineWidth = 8;
-     // Background circle
-     ctx.strokeStyle = 'rgba(80, 80, 80, 0.7)';
-     ctx.beginPath();
-     ctx.arc(uiHpX, uiHpY, uiHpRadius, 0, Math.PI * 2);
-     ctx.stroke();
-     // HP Fill arc
-     ctx.strokeStyle = hpPercent > 0.6 ? '#4CAF50' : (hpPercent > 0.3 ? '#ffc107' : '#f44336');
-     ctx.beginPath();
-     ctx.arc(uiHpX, uiHpY, uiHpRadius, -Math.PI / 2, -Math.PI / 2 + angle); // Start from top
-     ctx.stroke();
-     // HP Text
-     ctx.fillStyle = '#ffffff';
-     ctx.font = 'bold 18px sans-serif';
-     ctx.textAlign = 'center';
-     ctx.shadowColor = 'black'; ctx.shadowBlur = 2;
-     ctx.fillText(selfData.hp, uiHpX, uiHpY + 6); // Adjust vertical alignment
-     ctx.shadowBlur = 0;
+    // --- Level Display ---
+    const levelY = canvas.height - (UI_XP_BAR_HEIGHT + 20 + 8); // Position above XP bar
+    ctx.font = UI_FONT_LARGE;
+    ctx.shadowBlur = TEXT_SHADOW_BLUR;
+    ctx.fillText(`Level: ${selfData.level}`, canvas.width / 2, levelY);
+    ctx.shadowBlur = 0;
+
+    // --- HP Circle (Bottom Left) ---
+    const hpCircleY = canvas.height - 80; // Keep Y constant relative to bottom
+    const hpPercent = selfData.maxHp > 0 ? Math.max(0, selfData.hp / selfData.maxHp) : 0;
+    const angle = hpPercent * Math.PI * 2;
+
+    ctx.lineWidth = UI_HP_CIRCLE_WIDTH;
+    // Background circle
+    ctx.strokeStyle = UI_BAR_BG_COLOR; // Use same bg color for consistency
+    ctx.beginPath();
+    ctx.arc(UI_HP_CIRCLE_X, hpCircleY, UI_HP_CIRCLE_RADIUS, 0, Math.PI * 2);
+    ctx.stroke();
+    // HP Fill arc
+    if (angle > 0) { // Only draw arc if there's HP
+        ctx.strokeStyle = hpPercent > 0.6 ? HP_COLOR_HIGH : (hpPercent > 0.3 ? HP_COLOR_MID : HP_COLOR_LOW);
+        ctx.beginPath();
+        ctx.arc(UI_HP_CIRCLE_X, hpCircleY, UI_HP_CIRCLE_RADIUS, -Math.PI / 2, -Math.PI / 2 + angle);
+        ctx.stroke();
+    }
+    // HP Text
+    ctx.fillStyle = UI_TEXT_COLOR;
+    ctx.font = 'bold 18px sans-serif';
+    ctx.shadowBlur = TEXT_SHADOW_BLUR;
+    ctx.fillText(selfData.hp, UI_HP_CIRCLE_X, hpCircleY + 6); // Adjust text position
+    ctx.shadowBlur = 0;
 
 
-     // Draw Kill Count (Top Right)
-     ctx.fillStyle = '#ffffff';
-     ctx.textAlign = 'right';
-     ctx.font = '16px sans-serif';
-     ctx.shadowColor = 'black'; ctx.shadowBlur = 3;
+     // --- Kill Count (Top Right) ---
+     ctx.textAlign = 'right'; // Align right for top-right corner
+     ctx.font = UI_FONT_LARGE;
+     ctx.shadowBlur = TEXT_SHADOW_BLUR;
      ctx.fillText(`Kills: ${selfData.killCount || 0}`, canvas.width - 20, 30);
      ctx.shadowBlur = 0;
 
-     // Draw crosshair if not using touch
+     // --- Crosshair (Non-touch only) ---
       if (!isTouchDevice) {
+          const crosshairSize = 8;
            ctx.strokeStyle = 'rgba(255, 255, 255, 0.5)';
            ctx.lineWidth = 1;
            ctx.beginPath();
-           ctx.moveTo(mouseScreenX - 8, mouseScreenY); ctx.lineTo(mouseScreenX + 8, mouseScreenY);
-           ctx.moveTo(mouseScreenX, mouseScreenY - 8); ctx.lineTo(mouseScreenX, mouseScreenY + 8);
+           ctx.moveTo(mouseScreenX - crosshairSize, mouseScreenY); ctx.lineTo(mouseScreenX + crosshairSize, mouseScreenY);
+           ctx.moveTo(mouseScreenX, mouseScreenY - crosshairSize); ctx.lineTo(mouseScreenX, mouseScreenY + crosshairSize);
            ctx.stroke();
       }
 }
+
 
 // =============================================================================
 // UTILITY FUNCTIONS
@@ -1129,23 +1110,26 @@ function lerp(start, end, amount) {
     return start + (end - start) * amount;
 }
 
+// Calculate camera view bounds (cached per frame)
 function getCameraViewBounds() {
-     // Use cached half-dimensions
-     return {
-         left: camera.x - canvasHalfWidth,
-         right: camera.x + canvasHalfWidth,
-         top: camera.y - canvasHalfHeight,
-         bottom: camera.y + canvasHalfHeight
-     };
+    const halfWidth = canvas.width / 2;
+    const halfHeight = canvas.height / 2;
+    // Use camera's current position (already interpolated/smoothed)
+    return {
+        left: camera.x - halfWidth,
+        right: camera.x + halfWidth,
+        top: camera.y - halfHeight,
+        bottom: camera.y + halfHeight
+    };
 }
 
+// Optimized culling check
 function isPointInBounds(x, y, bounds, margin = 0) {
-     // Simplified check
-     return x + margin >= bounds.left &&
-            x - margin <= bounds.right &&
-            y + margin >= bounds.top &&
-            y - margin <= bounds.bottom;
+    return x + margin >= bounds.left &&
+           x - margin <= bounds.right &&
+           y + margin >= bounds.top &&
+           y - margin <= bounds.bottom;
 }
 
 // --- Start the application ---
-init();
+init(); // Start the client initialization process
