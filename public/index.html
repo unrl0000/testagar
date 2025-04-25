@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>RuneRealms.io (Concept)</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+    <div id="start-screen">
+        <h1>RuneRealms.io</h1>
+        <input type="text" id="name-input" placeholder="Enter your name" maxlength="16">
+        <div id="race-selection">
+            <p>Choose your Race:</p>
+            <button data-race="human">Human</button>
+            <button data-race="elf">Elf</button>
+            <button data-race="gnome">Gnome</button>
+            <button data-race="vampire">Vampire</button>
+            <button data-race="goblin">Goblin</button>
+        </div>
+        <button id="start-button">Join Game</button>
+        <p id="error-message" class="error"></p>
+    </div>
+
+    <div id="level2-selection" style="display: none;">
+        <h2>Level 2! Choose Specialization:</h2>
+        <div id="level2-options">
+            <!-- Options will be added dynamically by JS -->
+        </div>
+    </div>
+
+    <canvas id="game-canvas"></canvas>
+
+    <!-- Touch Controls Overlay (Optional but recommended for mobile) -->
+    <div id="touch-controls" style="display: none;">
+        <div id="joystick-area">
+            <div id="joystick-thumb"></div>
+        </div>
+        <div id="attack-button-area">
+            <button id="attack-button">Attack</button>
+        </div>
+    </div>
+
+    <script src="client.js"></script>
+</body>
+</html>
